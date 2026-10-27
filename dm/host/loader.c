@@ -28,16 +28,51 @@ static pthread_key_t key_value(unsigned i) {
     default: return g_keygate;
     }
 }
+// What the rewritten code adds to its thread base to reach a key's value (the key page entries; patch_nso.py emit_tsd_base):
+//   Apple: the base is tpidrro_el0, the pthread TSD array, and a key's value is at key × 8;
+//   Android: the base is bionic's pthread_internal_t (slot 1 of the TLS slots tpidr_el0 points at), and a key's value lies at an offset that differs between Android versions:
+//   measured here by storing two different marks in the key and finding the one word that holds each (create_keys)
+#if defined(__ANDROID__)
+#define DM_TARGET_NAME "android"
+static uint64_t g_slot_off[KEY_N];
+static uint64_t *thread_base(void) { uint64_t *tls; __asm__ volatile("mrs %0, tpidr_el0" : "=r"(tls)); return (uint64_t *)tls[1]; }
+static uint64_t measure_slot(pthread_key_t k) {
+    static const uint64_t mark[2] = {0x6e786e61746976e1ull, 0x9187919e8b968901ull};
+    uint64_t *b = thread_base(), at = 0;
+    for (int r = 0; r < 2; r++) {
+        pthread_setspecific(k, (void *)mark[r]);
+        uint64_t hit = 0; int n = 0;
+        for (uint64_t i = 0; i < 0x4000 / 8; i++) if (b[i] == mark[r]) { hit = i * 8; n++; }
+        if (n != 1 || (r && hit != at)) die("bionic's thread structure: key %u found %d times (mark %d); the host cannot place its thread slots", (unsigned)k, n, r);
+        at = hit;
+    }
+    pthread_setspecific(k, NULL);
+    return at;
+}
+static uint64_t slot_offset(unsigned i) { return g_slot_off[i]; }
+#else
+#define DM_TARGET_NAME "apple"
+static uint64_t slot_offset(unsigned i) { return (uint64_t)key_value(i) * 8; }
+#endif
 static void create_keys(void) {
     if (pthread_key_create(&g_key18, NULL) || pthread_key_create(&g_keytls, NULL) ||
         pthread_key_create(&g_keytlr, NULL) || pthread_key_create(&g_keygate, NULL)) die("cannot create the host key");
-    LOG("key numbers K18=%lu KTLS=%lu KTLR=%lu KGATE=%lu", g_key18, g_keytls, g_keytlr, g_keygate);
+    LOG("key numbers K18=%lu KTLS=%lu KTLR=%lu KGATE=%lu", (unsigned long)g_key18, (unsigned long)g_keytls, (unsigned long)g_keytlr, (unsigned long)g_keygate);
+#if defined(__ANDROID__)
+    for (unsigned i = 0; i < KEY_N; i++) g_slot_off[i] = measure_slot(key_value(i));
+    LOG("thread slots in bionic's thread structure at +%#llx +%#llx +%#llx +%#llx", (unsigned long long)g_slot_off[0], (unsigned long long)g_slot_off[1],
+        (unsigned long long)g_slot_off[2], (unsigned long long)g_slot_off[3]);
+#endif
 }
 
-// K slot check: the pthread TSD layout is fixed, slot = tpidrro_el0 + 8*key
+// K slot check, through the same base and key page entry the rewritten code uses
 static void tsd_check(void) {
     pthread_setspecific(g_key18, (void *)0x1234);
+#if defined(__ANDROID__)
+    uint64_t base = (uint64_t)thread_base();
+#else
     uint64_t base; __asm__ volatile("mrs %0, tpidrro_el0" : "=r"(base));
+#endif
     uint64_t off = *(uint64_t *)(g_mod[0].base + g_mod[0].key_page_off + g_mod[0].key_idx[KEY_K18] * 8);
     if (((uint64_t *)(base & ~7ull))[off / 8] != 0x1234) die("TSD layout mismatch");
     pthread_setspecific(g_key18, 0);
@@ -188,7 +223,14 @@ static void read_layout(module_t *m, const char *dir) {
     if (!f) die("open %s", path);
     static const char *kn[KEY_N] = {"K18", "KTLS", "KTLR", "KGATE"};
     char line[256], key[32]; unsigned long v; unsigned seen = 0;
+    int target_seen = 0;
     while (fgets(line, sizeof line, f)) {
+        // The platform the module was rewritten for (patch_nso.py DM_TARGET): thread slots are reached differently. Older outputs have no line and were rewritten for Apple
+        char tg[16];
+        if (sscanf(line, "# TARGET %15s", tg) == 1) {
+            if (strcmp(tg, DM_TARGET_NAME)) die("%s: rewritten for %s, this host runs on %s; rewrite the modules with DM_TARGET=%s", path, tg, DM_TARGET_NAME, DM_TARGET_NAME);
+            target_seen = 1; continue;
+        }
         if (sscanf(line, "# %31s %lx", key, &v) != 2) die("%s: the output comes from an old rewriter; rewrite the modules again with dm/tools/patch_nso.py", path);
         if (!strcmp(key, "PATCH_OFF")) m->patch_off = strtoll(line + 2 + strlen(key), NULL, 16);   // may be negative (patch area before the base)
         else if (!strcmp(key, "IMAGE_SIZE")) m->image_size = v;
@@ -208,6 +250,11 @@ static void read_layout(module_t *m, const char *dir) {
         }
     }
     fclose(f);
+#if defined(__ANDROID__)
+    if (!target_seen) die("%s: rewritten for Apple (no TARGET line); rewrite the modules with DM_TARGET=android", path);
+#else
+    (void)target_seen;
+#endif
     if (!m->patch_off || m->key_page_off % 0x4000 || m->key_page_size != 0x4000 || seen != (1u << KEY_N) - 1)
         die("%s: the output comes from an old rewriter; rewrite the modules again with dm/tools/patch_nso.py", path);
     if (m->patch_off < 0 && (!m->image_size || !m->file_image_len || m->file_image_len % 0x4000 || m->patch_off % 0x4000 || m->key_page_off + m->key_page_size > m->image_size))
@@ -242,7 +289,7 @@ static void install_key_page(module_t *m) {
     if (m->key_page_off + m->key_page_size > m->size) die("%s: key page out of range", m->name);
     uint64_t *page = (uint64_t *)(m->base + m->key_page_off);
     memset(page, 0, m->key_page_size);
-    for (unsigned i = 0; i < KEY_N; i++) page[m->key_idx[i]] = (uint64_t)key_value(i) * 8;
+    for (unsigned i = 0; i < KEY_N; i++) page[m->key_idx[i]] = slot_offset(i);
     for (int k = 0; k < KEY_N; k++) if (!page[m->key_idx[k]]) die("%s: key page entry %d is 0 (host key not created) -- the game would read TSD slot 0", m->name, k);
     if (mprotect(m->base + m->key_page_off, m->key_page_size, PROT_READ)) die("%s key page mprotect", m->name);
     if (m->fps_state_off) install_fps_state(m);
@@ -548,6 +595,7 @@ static void map_image(module_t *m, const char *dir) {
         m->base = a + pre;
         memcpy(m->base, raw, fl); memcpy(a, raw + fl, sz - fl); free(raw); install_key_page(m);
         uint64_t rx = (m->text_end + 0x3FFF) & ~0x3FFFull;
+        __builtin___clear_cache((char *)m->base, (char *)m->base + rx); __builtin___clear_cache((char *)a, (char *)a + m->patch_len);   // written as data: make instruction fetch see it (Linux's mprotect does not)
         if (mprotect(m->base, rx, PROT_READ | PROT_EXEC)) die("%s mprotect text", m->name);
         if (mprotect(a, m->patch_len, PROT_READ | PROT_EXEC)) die("%s mprotect patch", m->name);
         if (pre > m->patch_len && mprotect(a + m->patch_len, pre - m->patch_len, PROT_NONE)) die("%s mprotect gap", m->name);
@@ -557,9 +605,9 @@ static void map_image(module_t *m, const char *dir) {
     m->base = mmap(NULL, m->size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     if (m->base == MAP_FAILED) die("%s mmap", m->name);
     memcpy(m->base, raw, sz); free(raw); install_key_page(m);
-    uint64_t rx = (m->text_end + 0x3FFF) & ~0x3FFFull;
+    uint64_t rx = (m->text_end + 0x3FFF) & ~0x3FFFull, po = m->patch_off & ~0x3FFFull;
+    __builtin___clear_cache((char *)m->base, (char *)m->base + rx); __builtin___clear_cache((char *)m->base + po, (char *)m->base + m->size);   // as above
     if (mprotect(m->base, rx, PROT_READ | PROT_EXEC)) die("%s mprotect text", m->name);
-    uint64_t po = m->patch_off & ~0x3FFFull;
     if (mprotect(m->base + po, m->size - po, PROT_READ | PROT_EXEC)) die("%s mprotect patch", m->name);
 }
 #endif

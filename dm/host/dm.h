@@ -6,7 +6,28 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "game_profile.h"   // constants of the current game profile (generated from dm/games/<id>/game.tsv, chosen by the Makefile's GAME)
+#include "game_profile.h"
+// A registry section (the host's take-over tables: swhle, swforce, swnvn), read back with getsectiondata("__DATA", name): a Mach-O section in __DATA on Apple;
+// on Android an ELF section of that name, which dm/android/compat's getsectiondata finds through the linker's __start_ / __stop_ symbols
+#if defined(__ANDROID__)
+#define DM_SECTION(name) section(#name)
+#else
+#define DM_SECTION(name) section("__DATA," #name)
+#endif
+// Registers in a signal handler's context (ucontext_t *): the integer state as Darwin's arm_thread_state64 (an lvalue), the FP / SIMD registers and the fault syndrome
+#if defined(__ANDROID__)
+#define DM_UC_SS(uc) (*(struct __darwin_arm_thread_state64 *)&(uc)->uc_mcontext.regs[0])   // Linux's sigcontext keeps the same layout from regs[0] on (dm/android/compat)
+#define DM_UC_V(uc) dm_uc_v((struct ucontext *)(uc))
+#define DM_UC_FPSR(uc) (*dm_uc_fpsr((struct ucontext *)(uc)))
+#define DM_UC_FPCR(uc) (*dm_uc_fpcr((struct ucontext *)(uc)))
+#define DM_UC_ESR(uc) dm_uc_esr((struct ucontext *)(uc))
+#else
+#define DM_UC_SS(uc) ((uc)->uc_mcontext->__ss)
+#define DM_UC_V(uc) ((uc)->uc_mcontext->__ns.__v)
+#define DM_UC_FPSR(uc) ((uc)->uc_mcontext->__ns.__fpsr)
+#define DM_UC_FPCR(uc) ((uc)->uc_mcontext->__ns.__fpcr)
+#define DM_UC_ESR(uc) ((uc)->uc_mcontext->__es.__esr)
+#endif   // constants of the current game profile (generated from dm/games/<id>/game.tsv, chosen by the Makefile's GAME)
 
 // Explicit host work does not occupy a guest core (Metal submission, or a blocked native codec lock). A contended host mutex must count as blocked: a signal's same-core handoff
 // can otherwise wait forever for a peer that needs the signaller's native lock. Uncontended locks retain guest ordering; the counter nests inside existing host work.

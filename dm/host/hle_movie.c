@@ -8,8 +8,12 @@
 #include <unistd.h>
 #include "vpx/vpx_decoder.h"
 #include "vpx/vp8dx.h"
-#include "hle_movie_avc.h"   // H.264 on VideoToolbox
+#include "hle_movie_avc.h"   // H.264 on VideoToolbox (MediaCodec on Android: dm/android/movie_avc_mediacodec.c)
+#if defined(__ANDROID__)
+#include "../android/movie_aac_mediacodec.h"   // AAC on MediaCodec
+#else
 #include <AudioToolbox/AudioToolbox.h>   // AAC
+#endif
 // Vorbis (movie audio tracks, Link's Awakening): stb_vorbis, built into this file (dm/third_party/stb_vorbis); only its push-data API, floats out
 #define STB_VORBIS_NO_STDIO
 #define STB_VORBIS_NO_PULLDATA_API
@@ -84,7 +88,11 @@ typedef struct {
     // Vorbis: the identification and setup headers from Configure's MediaData ("csd-0", "csd-1", as with Android's MediaCodec), the decoder (opened at the first packet), channels / rate, Ogg page sequence
     uint8_t *vhdr[2]; int vhdr_n[2]; stb_vorbis *vb; int ch, rate; uint32_t ogg_seq; int64_t ogg_gran; int red_vb;
     // AAC (Monster Hunter Rise's movies): AudioToolbox's converter, opened at the first packet from the AudioSpecificConfig (Configure's csd-0, kept in vhdr[0]); the packet being fed
+#if defined(__ANDROID__)
+    maac *aac;
+#else
     AudioConverterRef aac; const uint8_t *aac_pkt; UInt32 aac_pkt_n; AudioStreamPacketDescription aac_desc;
+#endif
     uint64_t dec_n, dec_ns, dec_max;            // decode timing (on the host thread, per packet)
     unsigned long ncall[24];
 } mdec_t;
@@ -328,6 +336,7 @@ static int md_vorbis(mdec_t *d, const uint8_t *p, int n, int slot) {
 // The demuxer hands over raw AAC frames (1024 samples each) and the AudioSpecificConfig in csd-0. AudioToolbox takes the configuration as an MPEG-4 ES descriptor (the magic cookie built
 // here as FFmpeg's AudioToolbox decoder builds it); without csd-0 an AAC-LC configuration is made from the sample rate and channel count
 static uint8_t *esds_descr(uint8_t *p, int tag, unsigned n) { *p++ = (uint8_t)tag; for (int i = 3; i > 0; i--) *p++ = (uint8_t)(n >> (7 * i) | 0x80); *p++ = (uint8_t)(n & 0x7f); return p; }
+#if !defined(__ANDROID__)
 static OSStatus aac_feed(AudioConverterRef c, UInt32 *np, AudioBufferList *bl, AudioStreamPacketDescription **pd, void *ud) {
     (void)c; mdec_t *d = ud;
     if (!d->aac_pkt) { *np = 0; return 1; }   // this packet is used up: a non-zero status ends the fill with what was decoded
@@ -335,6 +344,7 @@ static OSStatus aac_feed(AudioConverterRef c, UInt32 *np, AudioBufferList *bl, A
     d->aac_desc = (AudioStreamPacketDescription){0, 0, d->aac_pkt_n}; if (pd) *pd = &d->aac_desc;
     *np = 1; d->aac_pkt = NULL; return 0;
 }
+#endif
 static int md_aac_open(mdec_t *d) {
     static const int rates[] = {96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350};
     uint8_t asc[64]; int an = d->vhdr_n[0] > 0 && d->vhdr_n[0] <= (int)sizeof asc ? d->vhdr_n[0] : 0;
@@ -345,6 +355,12 @@ static int md_aac_open(mdec_t *d) {
     }
     if (d->rate <= 0) d->rate = 48000; if (d->ch <= 0) d->ch = 2;
     if (!an) { int fi = 3; for (int i = 0; i < 13; i++) if (rates[i] == d->rate) fi = i; asc[0] = (uint8_t)(2 << 3 | fi >> 1); asc[1] = (uint8_t)((fi & 1) << 7 | (d->ch & 15) << 3); an = 2; }
+#if defined(__ANDROID__)
+    d->aac = maac_new(d->rate, d->ch, asc, an);
+    if (!d->aac) { d->red_vb++; return 0; }
+    LOG("[movie] AAC: %d channels %d Hz, AudioSpecificConfig %d bytes (object type %d)", d->ch, d->rate, an, asc[0] >> 3);
+    return 1;
+#else
     AudioStreamBasicDescription in = {.mSampleRate = d->rate, .mFormatID = kAudioFormatMPEG4AAC, .mFramesPerPacket = 1024, .mChannelsPerFrame = (UInt32)d->ch};
     AudioStreamBasicDescription out = {.mSampleRate = d->rate, .mFormatID = kAudioFormatLinearPCM, .mFormatFlags = kLinearPCMFormatFlagIsSignedInteger | kLinearPCMFormatFlagIsPacked,
                                        .mBytesPerPacket = 2u * d->ch, .mFramesPerPacket = 1, .mBytesPerFrame = 2u * d->ch, .mChannelsPerFrame = (UInt32)d->ch, .mBitsPerChannel = 16};
@@ -358,12 +374,18 @@ static int md_aac_open(mdec_t *d) {
     if (st && !d->red_vb++) LOG("[RED] movie: AAC configuration not accepted by AudioToolbox (%d)", (int)st);
     LOG("[movie] AAC: %d channels %d Hz, AudioSpecificConfig %d bytes (object type %d)", d->ch, d->rate, an, asc[0] >> 3);
     return 1;
+#endif
 }
 // one packet → PCM16 interleaved in the slot; 1 when there are samples (the decoder's start-up delay may give none for the first packet)
 static int md_aac(mdec_t *d, const uint8_t *p, int n, int slot) {
     if (!d->aac && !md_aac_open(d)) return 0;
     if (n <= 0) return 0;
     if (d->out[slot].cap < MD_PCM_CAP) { free(d->out[slot].frm); d->out[slot].frm = malloc(MD_PCM_CAP); d->out[slot].cap = MD_PCM_CAP; }
+#if defined(__ANDROID__)
+    int got = maac_decode(d->aac, p, n, (int16_t *)d->out[slot].frm, (int)(MD_PCM_CAP / (2 * d->ch)));
+    d->out[slot].bytes = (size_t)got * 2 * d->ch;
+    return got > 0;
+#else
     d->aac_pkt = p; d->aac_pkt_n = (UInt32)n;
     UInt32 frames = (UInt32)(MD_PCM_CAP / (2 * d->ch));
     AudioBufferList ob = {1, {{(UInt32)d->ch, frames * 2u * d->ch, d->out[slot].frm}}};
@@ -372,6 +394,7 @@ static int md_aac(mdec_t *d, const uint8_t *p, int n, int slot) {
     if (st && st != 1 && !d->red_dec++) LOG("[RED] movie: AAC decode error (AudioToolbox %d, first case)", (int)st);
     d->out[slot].bytes = (size_t)frames * 2 * d->ch;
     return frames > 0;
+#endif
 }
 // The H.264 decoder, made by Configure (when the stream's parameter sets come with it) or by the first packet; RGBA pictures in the native texture mode either way.
 // Absolum's movies bring csd-0 / csd-1 to Configure, and a decoder made there used to stay NV12: the frames' bytes went into the RGBA texture as they were
@@ -385,7 +408,13 @@ static int md_avc(mdec_t *d, const uint8_t *p, int n, int slot, int take_only) {
     if (d->out[slot].cap < need) { free(d->out[slot].frm); d->out[slot].frm = malloc(need); d->out[slot].cap = need; }
     return mavc_take(d->avc, d->jflush, d->out[slot].frm, d->w, d->h, &d->jpts_out);
 }
-static void md_close(mdec_t *d) { if (d->vpx_on) { vpx_codec_destroy(&d->vpx); d->vpx_on = 0; } if (d->vb) { stb_vorbis_close(d->vb); d->vb = NULL; } if (d->aac) { AudioConverterDispose(d->aac); d->aac = NULL; } if (d->avc) { mavc_free(d->avc); d->avc = NULL; } }
+static void md_close(mdec_t *d) { if (d->vpx_on) { vpx_codec_destroy(&d->vpx); d->vpx_on = 0; } if (d->vb) { stb_vorbis_close(d->vb); d->vb = NULL; } if (d->aac) {
+#if defined(__ANDROID__)
+    maac_free(d->aac);
+#else
+    AudioConverterDispose(d->aac);
+#endif
+    d->aac = NULL; } if (d->avc) { mavc_free(d->avc); d->avc = NULL; } }
 void dm_host_helper_qos(qos_class_t q);   // hle_thread.c
 static void *md_worker(void *arg) {
     mdec_t *d = arg;

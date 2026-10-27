@@ -79,7 +79,7 @@ static int g_rec = -1;
 static inline int rec_on(void) {
     if (__builtin_expect(g_rec >= 0, 1)) return g_rec;
     const char *e = getenv("DM_NVN_ENC_THREAD");
-#if TARGET_OS_IPHONE
+#if TARGET_OS_IPHONE || defined(__ANDROID__)   // the phones
     g_rec = !e || atoi(e) > 0;
 #else
     g_rec = e && atoi(e) > 0;

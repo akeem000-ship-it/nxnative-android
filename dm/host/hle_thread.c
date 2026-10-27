@@ -328,7 +328,7 @@ static void on_pause_sig(int sig, siginfo_t *si, void *uc_) {
     (void)sig; (void)si;
     thr_t *t = pthread_getspecific(g_keythr);
     if (!t || !atomic_load(&t->pause_req) || atomic_load(&t->svc_regs)) return;
-    ucontext_t *uc = uc_; const struct __darwin_arm_thread_state64 *ss = &uc->uc_mcontext->__ss;
+    ucontext_t *uc = uc_; const struct __darwin_arm_thread_state64 *ss = &DM_UC_SS(uc);
     if (!module_of((void *)__darwin_arm_thread_state64_get_pc(*ss))) return;   // in host code: do not stop; the requester resends
     pthread_mutex_lock(&G);
     if (t->pause_req) {
@@ -339,7 +339,7 @@ static void on_pause_sig(int sig, siginfo_t *si, void *uc_) {
         t->ctx_x[18] = (uint64_t)(uintptr_t)pthread_getspecific(g_key18);
         t->ctx_fp = __darwin_arm_thread_state64_get_fp(*ss); t->ctx_lr = __darwin_arm_thread_state64_get_lr(*ss);
         t->ctx_sp = __darwin_arm_thread_state64_get_sp(*ss) - 32; t->ctx_pc = __darwin_arm_thread_state64_get_pc(*ss); t->ctx_pstate = ss->__cpsr;
-        memcpy(t->ctx_v, uc->uc_mcontext->__ns.__v, sizeof t->ctx_v); t->ctx_fpcr = uc->uc_mcontext->__ns.__fpcr; t->ctx_fpsr = uc->uc_mcontext->__ns.__fpsr;
+        memcpy(t->ctx_v, DM_UC_V(uc), sizeof t->ctx_v); t->ctx_fpcr = DM_UC_FPCR(uc); t->ctx_fpsr = DM_UC_FPSR(uc);
         t->ctx_ok = 1; t->paused = 1; pthread_cond_broadcast(&t->pcv);
         while (t->pause_req) pthread_cond_wait(&t->pcv, &G);
         t->paused = 0; t->ctx_ok = 0;

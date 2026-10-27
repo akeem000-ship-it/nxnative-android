@@ -1,9 +1,13 @@
 // nn::audio AudioOut: the game (FMOD nx output layer) appends PCM buffers block by block; once played the system puts them back on the "released" queue and signals the event.
-// Host: real audio output = CoreAudio AudioUnit (Mac DefaultOutput / iOS RemoteIO); silent sink = consumes buffers in real time (no sound, pacing matches the real device).
+// Host: real audio output = CoreAudio AudioUnit (Mac DefaultOutput / iOS RemoteIO; AAudio on Android, dm/android/au_aaudio.c); silent sink = consumes buffers in real time (no sound, pacing matches the real device).
 //       iOS defaults to real audio output (the product must have sound), tests that want silence set DM_AUDIO=0 explicitly; Mac defaults to the silent sink (replay / gate checks are silent), DM_AUDIO=1 for real audio output.
 // The contents of AudioOut / AudioOutBuffer / AudioOutParameter are read and written only through the interfaces below; the host defines its own internal layout and only writes the front part of the structs (AudioOut: the SDK's own fields, au_info).
 #include "hle.h"
+#if defined(__ANDROID__)
+#include "../android/au_aaudio.h"   // the same calls on AAudio
+#else
 #include <AudioToolbox/AudioToolbox.h>
+#endif
 #include <TargetConditionals.h>
 #include <dispatch/dispatch.h>
 #include <stdatomic.h>
@@ -160,7 +164,7 @@ static OSStatus au_render(void *ctx, AudioUnitRenderActionFlags *f, const AudioT
       if (mute) memset(bl->mBuffers[0].mData, 0, bl->mBuffers[0].mDataByteSize); }
     return noErr;
 }
-#if !TARGET_OS_IPHONE
+#if TARGET_OS_OSX   // CoreAudio device buffer (not on iOS or Android)
 // Mac DefaultOutput's default 512 device frames can exceed the PCM a game has queued, producing zero-filled gaps.
 // Request about 5 ms of device frames, as front_ios.m asks of the iOS audio session; reapply on device or output-rate changes within the supported range.
 // DM_DBG_AU_FRAMES=N asks N frames instead (1024 = the iOS default, which reproduces the crackling)
@@ -192,14 +196,21 @@ static void au_device_changed(void *ctx, AudioUnit au, AudioUnitPropertyID id, A
 }
 #endif
 static void au_dispose(AudioUnit au) {
-#if !TARGET_OS_IPHONE
+#if defined(__ANDROID__)
+    dm_aaudio_dispose(au); return;
+#elif !TARGET_OS_IPHONE
     // Disposal clears CurrentDevice and notifies listeners. Remove them before the unit tears down its device.
     AudioUnitRemovePropertyListenerWithUserData(au, kAudioOutputUnitProperty_CurrentDevice, au_device_changed, NULL);
     AudioUnitRemovePropertyListenerWithUserData(au, kAudioUnitProperty_StreamFormat, au_device_changed, NULL);
 #endif
+#if !defined(__ANDROID__)
     AudioUnitUninitialize(au); AudioComponentInstanceDispose(au);
+#endif
 }
 static OSStatus au_create(aout *a) {
+#if defined(__ANDROID__)
+    return dm_aaudio_create(&a->au, RATE, device_channels(a), au_render, a);
+#else
     AudioComponentDescription d = {.componentType = kAudioUnitType_Output,
 #if TARGET_OS_IPHONE
                                    .componentSubType = kAudioUnitSubType_RemoteIO,
@@ -215,7 +226,7 @@ static OSStatus au_create(aout *a) {
                                      .mBytesPerPacket = 2u * ch, .mFramesPerPacket = 1, .mBytesPerFrame = 2u * ch,
                                      .mChannelsPerFrame = ch, .mBitsPerChannel = 16};
     AURenderCallbackStruct cb = {au_render, a};
-#if !TARGET_OS_IPHONE
+#if TARGET_OS_OSX
     const AudioUnitPropertyID props[] = {kAudioOutputUnitProperty_CurrentDevice, kAudioUnitProperty_StreamFormat};
     for (unsigned i = 0; i < sizeof props / sizeof *props; i++) {
         OSStatus st = AudioUnitAddPropertyListener(a->au, props[i], au_device_changed, NULL);
@@ -228,6 +239,7 @@ static OSStatus au_create(aout *a) {
     if (!st) st = AudioUnitInitialize(a->au);
     if (st) { au_dispose(a->au); a->au = NULL; }
     return st;
+#endif
 }
 // OpenAudioOut runs on the game's thread, and creating the AudioUnit takes about 24 KB of stack (measured on the Mac: component lookup, instance, Initialize), more than some game threads have
 // left (Super Mario 3D World's save thread has 8 KB in all; Pokémon: Let's Go overflowed here at startup, PR #36). So it runs on a host thread, once per AudioOut. Not HLE_FORCE_BIG:
@@ -257,7 +269,12 @@ static void backend_stop(aout *a) {
     if (a->backend == BK_AU) { AudioOutputUnitStop(a->au); a->backend = BK_NONE; }
     else if (a->backend == BK_NULL) null_stop(a);
 }
-static int real_audio(void) { const char *e = getenv("DM_AUDIO"); return e ? atoi(e) != 0 : TARGET_OS_IPHONE; }
+#if TARGET_OS_IPHONE || defined(__ANDROID__)
+#define DM_AUDIO_DEFAULT 1   // the phones play sound by default
+#else
+#define DM_AUDIO_DEFAULT 0
+#endif
+static int real_audio(void) { const char *e = getenv("DM_AUDIO"); return e ? atoi(e) != 0 : DM_AUDIO_DEFAULT; }
 // Start the AudioUnit of an output whose backend is BK_NONE (callers hold g_aos_lock). When the device refuses (the session is held by a call, or is being reset), the silent sink stands in and the watchdog retries
 static void au_go(aout *a, uint64_t now) {
     OSStatus st = a->au ? AudioOutputUnitStart(a->au) : -1;
@@ -514,7 +531,7 @@ void dm_audio_reset(void) {
         aout *a = g_aos[i]; if (!a || !a->au) continue;
         int playing = a->backend == BK_AU;
         if (playing) { AudioOutputUnitStop(a->au); a->backend = BK_NONE; }
-        AudioUnitUninitialize(a->au); AudioComponentInstanceDispose(a->au);
+        au_dispose(a->au);
         OSStatus st = au_create(a);
         if (st) LOG("[RED] audio #%d: no AudioUnit after the media services reset (status %d): this output stays silent", a->id, (int)st);
         if (playing) { if (a->au && !g_suspended) { a->stalled = 0; au_go(a, now_ns()); } else null_start(a); }

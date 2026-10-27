@@ -36,13 +36,21 @@ uintptr_t dm_bigstack_top(uintptr_t sp) {
     return (uintptr_t)top;
 }
 
+// Symbol names in the assembly below: Mach-O prefixes C names with an underscore, ELF does not
+#if defined(__ANDROID__)
+#define DM_ASM_SYM(n) #n
+#define DM_ASM_HIDDEN(n) ".hidden " #n "\n.type " #n ", %function\n"
+#else
+#define DM_ASM_SYM(n) "_" #n
+#define DM_ASM_HIDDEN(n) ".private_extern _" #n "\n"
+#endif
 // x16 = implementation. Frame (on the original stack, 0xa0 bytes): +0x00 x0-x8, x16, +0x50 d0-d7, +0x90 x29 / x30. After the switch the original sp is stored at the new stack top and restored when the implementation returns
 __asm__(
     ".text\n"
     ".p2align 2\n"
-    ".globl _dm_bigstack_enter\n"
-    ".private_extern _dm_bigstack_enter\n"
-    "_dm_bigstack_enter:\n"
+    ".globl " DM_ASM_SYM(dm_bigstack_enter) "\n"
+    DM_ASM_HIDDEN(dm_bigstack_enter)
+    DM_ASM_SYM(dm_bigstack_enter) ":\n"
     "    sub sp, sp, #0xa0\n"
     "    stp x29, x30, [sp, #0x90]\n"
     "    add x29, sp, #0x90\n"
@@ -56,7 +64,7 @@ __asm__(
     "    stp d4, d5, [sp, #0x70]\n"
     "    stp d6, d7, [sp, #0x80]\n"
     "    mov x0, sp\n"
-    "    bl _dm_bigstack_top\n"
+    "    bl " DM_ASM_SYM(dm_bigstack_top) "\n"
     "    mov x17, x0\n"
     "    ldp x0, x1, [sp, #0x00]\n"
     "    ldp x2, x3, [sp, #0x10]\n"
