@@ -225,6 +225,10 @@ A connected game controller hides the touch controls and keeps every button.
 - Fire Emblem: Three Houses: small square patches on the ground where decals land.
 - Super Mario Galaxy and Super Mario Galaxy 2: effects drawn as points or lines come out one pixel wide.
 
+## Android (in progress)
+
+An Android port is under way in [dm/android](dm/android/README.md): the host builds for Android 12 and later (arm64), and `--platform android` packs an APK. There is no graphics backend yet, so games do not show anything on Android.
+
 ## For developers
 
 How it works, the script's options, running games on the Mac and adding a game: [docs/development.md](docs/development.md). Per-game notes: [dm/games](dm/games/README.md#games). In-depth bring-up and debugging notes: [docs/agents](docs/agents/README.md).
