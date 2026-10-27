@@ -35,7 +35,7 @@ class RewriteTarget(unittest.TestCase):
         self.assertEqual(sum('tpidrro_el0' in x for x in ins), 5)
         self.assertFalse(any(x.endswith('tpidr_el0') for x in ins))
 
-    def test_android_reads_bionics_thread_through_tls_slot_1(self):
+    def test_android_reads_bionic_tls_through_tls_slot_minus_1(self):
         fix, ins = self.rewrite('android')
         self.assertIn('# TARGET\tandroid', fix)
         self.assertFalse(any('tpidrro_el0' in x for x in ins))
@@ -43,7 +43,7 @@ class RewriteTarget(unittest.TestCase):
         self.assertEqual(len(reads), 5)
         for i in reads:
             r = ins[i].split()[1].rstrip(',')
-            self.assertEqual(ins[i + 1], f'ldr {r}, [{r}, #8]')
+            self.assertEqual(ins[i + 1], f'ldur {r}, [{r}, #-8]')
 
     def test_unknown_target_is_refused(self):
         with tempfile.TemporaryDirectory() as d:

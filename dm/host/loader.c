@@ -30,23 +30,15 @@ static pthread_key_t key_value(unsigned i) {
 }
 // What the rewritten code adds to its thread base to reach a key's value (the key page entries; patch_nso.py emit_tsd_base):
 //   Apple: the base is tpidrro_el0, the pthread TSD array, and a key's value is at key × 8;
-//   Android: the base is bionic's pthread_internal_t (slot 1 of the TLS slots tpidr_el0 points at), and a key's value lies at an offset that differs between Android versions:
-//   measured here by storing two different marks in the key and finding the one word that holds each (create_keys)
+//   Android: the base is the thread's bionic_tls (slot -1 of the TLS slots tpidr_el0 points at, where bionic keeps pthread key values since Android 10), and a key's value lies at
+//   an offset bionic does not publish: measured once by dm_bionic_key_offset (dm/android/compat) in create_keys
 #if defined(__ANDROID__)
 #define DM_TARGET_NAME "android"
 static uint64_t g_slot_off[KEY_N];
-static uint64_t *thread_base(void) { uint64_t *tls; __asm__ volatile("mrs %0, tpidr_el0" : "=r"(tls)); return (uint64_t *)tls[1]; }
+static uint64_t *thread_base(void) { uint64_t *tls; __asm__ volatile("mrs %0, tpidr_el0" : "=r"(tls)); return (uint64_t *)tls[-1]; }
 static uint64_t measure_slot(pthread_key_t k) {
-    static const uint64_t mark[2] = {0x6e786e61746976e1ull, 0x9187919e8b968901ull};
-    uint64_t *b = thread_base(), at = 0;
-    for (int r = 0; r < 2; r++) {
-        pthread_setspecific(k, (void *)mark[r]);
-        uint64_t hit = 0; int n = 0;
-        for (uint64_t i = 0; i < 0x4000 / 8; i++) if (b[i] == mark[r]) { hit = i * 8; n++; }
-        if (n != 1 || (r && hit != at)) die("bionic's thread structure: key %u found %d times (mark %d); the host cannot place its thread slots", (unsigned)k, n, r);
-        at = hit;
-    }
-    pthread_setspecific(k, NULL);
+    uint64_t at = dm_bionic_key_offset(k);   // dm/android/compat
+    if (at == ~0ull) die("bionic's thread data: the value of key %u was not found exactly once; the host cannot place its thread slots", (unsigned)k);
     return at;
 }
 static uint64_t slot_offset(unsigned i) { return g_slot_off[i]; }
@@ -60,7 +52,7 @@ static void create_keys(void) {
     LOG("key numbers K18=%lu KTLS=%lu KTLR=%lu KGATE=%lu", (unsigned long)g_key18, (unsigned long)g_keytls, (unsigned long)g_keytlr, (unsigned long)g_keygate);
 #if defined(__ANDROID__)
     for (unsigned i = 0; i < KEY_N; i++) g_slot_off[i] = measure_slot(key_value(i));
-    LOG("thread slots in bionic's thread structure at +%#llx +%#llx +%#llx +%#llx", (unsigned long long)g_slot_off[0], (unsigned long long)g_slot_off[1],
+    LOG("thread slots in bionic's thread data at +%#llx +%#llx +%#llx +%#llx", (unsigned long long)g_slot_off[0], (unsigned long long)g_slot_off[1],
         (unsigned long long)g_slot_off[2], (unsigned long long)g_slot_off[3]);
 #endif
 }

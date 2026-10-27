@@ -120,12 +120,12 @@ def emit_key_addr(reg, kind):
 
 # Target (DM_TARGET): 'apple' (default) or 'android'. Only the base the key page offsets are added to differs:
 #   apple:   tpidrro_el0 = the pthread TSD array, a key's slot at + key × 8 (one instruction)
-#   android: tpidr_el0 points at bionic's TLS slots, whose slot 1 (TLS_SLOT_THREAD_ID) is the thread's pthread_internal_t; the loader measures where a key's value lies in it
-#            (dm/host/loader.c tsd_check) and writes that offset into the key page (two instructions)
+#   android: tpidr_el0 points at bionic's TLS slots, whose slot -1 (TLS_SLOT_BIONIC_TLS) is the thread's bionic_tls, where pthread key values live (Android 10 and later);
+#            the loader measures where a key's value lies in it (dm/android/compat dm_bionic_key_offset) and writes that offset into the key page (two instructions)
 TARGET = os.environ.get('DM_TARGET', 'apple')
 assert TARGET in ('apple', 'android'), f'DM_TARGET={TARGET}: must be apple or android'
 def emit_tsd_base(reg):
-    if TARGET == 'android': emit(MRS_TPIDR(reg)); emit(LDRX(reg, reg, 1))
+    if TARGET == 'android': emit(MRS_TPIDR(reg)); emit(LDUR(reg, reg, -8))
     else: emit(MRS_TPIDRRO(reg))
 
 def emit_slot_addr(base, key_reg, kind):

@@ -122,6 +122,10 @@ int dm_task_mem_read(dm_task_mem *m);
 
 int thread_selfcounts(int type, void *buf, size_t nbytes);   // Darwin's per-thread {instructions, cycles}: zeros (Android gives apps no performance counters)
 
+// ---- bionic thread data: where pthread key k's value lies in the calling thread's bionic_tls (slot -1 of the TLS slots tpidr_el0 points at: TLS_SLOT_BIONIC_TLS, which
+// holds the key values since Android 10), the same offset in every thread; found by storing two different marks in the key and requiring exactly one word to hold each. ~0 when it is not found (dm/host/loader.c) ----
+uint64_t dm_bionic_key_offset(pthread_key_t k);
+
 // ---- Time: Mach absolute time is in nanoseconds here (timebase 1 / 1) ----
 typedef struct { uint32_t numer, denom; } mach_timebase_info_data_t;
 static inline kern_return_t mach_timebase_info(mach_timebase_info_data_t *t) { t->numer = t->denom = 1; return KERN_SUCCESS; }

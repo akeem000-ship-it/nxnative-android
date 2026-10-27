@@ -1,5 +1,7 @@
 // Linux / bionic implementation of the Darwin subset in darwin_compat.h (see there for what each group does)
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include "darwin_compat.h"
 #include <dirent.h>
 #include <stdio.h>
@@ -209,6 +211,31 @@ kern_return_t task_info(mach_port_t task, int flavor, task_info_t info, mach_msg
         if (count) *count = TASK_POWER_INFO_V2_COUNT; return KERN_SUCCESS;
     }
     return KERN_INVALID_ARGUMENT;
+}
+
+// ---- bionic thread data ----
+uint64_t dm_bionic_key_offset(pthread_key_t k) {
+    static const uint64_t mark[2] = {0x6e786e61746976e1ull, 0x9187919e8b968901ull};
+    uint64_t *tls; __asm__ volatile("mrs %0, tpidr_el0" : "=r"(tls));
+    const uint64_t b = tls[-1]; uint64_t at = ~0ull;
+    void *was = pthread_getspecific(k);
+    // The key data sits within the first 16 KB of bionic_tls, but what follows it may be unmapped: copy what is readable with fault-safe reads, a page at a time, and scan the copy
+    uint64_t buf[0x4000 / 8]; size_t len = 0;
+    while (len < sizeof buf) {   // a page at a time: a read within one page succeeds or fails whole
+        size_t want = len ? 4096 : 4096 - (size_t)(b & 4095); if (len + want > sizeof buf) want = sizeof buf - len;
+        vm_size_t got = 0; vm_read_overwrite(0, (vm_address_t)(b + len), want, (vm_address_t)((uint8_t *)buf + len), &got);
+        len += got; if (got < want) break;
+    }
+    for (int r = 0; r < 2; r++) {
+        if (pthread_setspecific(k, (void *)mark[r])) return ~0ull;
+        uint64_t hit = ~0ull; int n = 0;
+        vm_size_t got = 0; vm_read_overwrite(0, (vm_address_t)b, len, (vm_address_t)buf, &got);
+        for (uint64_t i = 0; i < got / 8; i++) if (buf[i] == mark[r]) { hit = i * 8; n++; }
+        if (n != 1 || (r && hit != at)) { pthread_setspecific(k, was); return ~0ull; }
+        at = hit;
+    }
+    pthread_setspecific(k, was);
+    return at;
 }
 
 // ---- Time ----
