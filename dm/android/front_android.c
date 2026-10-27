@@ -1,7 +1,8 @@
 // Android front end (NativeActivity): the same-named interface as the Mac front end (dm/host/front_mac.m) and the iOS app (dm/ios), front.h.
 //   · Boot (as dm/ios/Sources/main.m): the host log goes to <external files>/log.txt and to logcat; env.txt there sets environment switches (KEY=VALUE per line, # comments);
 //     the rewritten modules and tables packed into the APK (assets/dm, listed in assets/dm/files.txt) are copied to internal storage once per APK build; the game's RomFS is
-//     <external files>/romfs (pushed by dm/android/tools/build_apk.py --push or adb); saves and temporary files are in internal storage. Then the host's main runs on a 64 MB stack thread.
+//     <external files>/romfs.img (a complete RomFS image, dm/tools/romfs_image.py) or the folder <external files>/romfs (pushed by dm/android/tools/build_apk.py --push or adb);
+//     saves and temporary files are in internal storage; without a packed standard shared font an Android system font stands in. Then the host's main runs on a 64 MB stack thread.
 //   · Lifecycle (as front_ios.m): focus lost / gained → dm_focus_set 2 / 1; the app stopped (background) → focus 3, audio paused, guest clock frozen, graphics suspended; started again → the reverse.
 //   · Input: game controllers by position (right A, bottom B, top X, left Y, as front_mac.m and DmGamepad.m), the left / right sticks, the d-pad as keys or as a hat, the triggers as ZL / ZR;
 //     up to DM_PLAYERS controllers, the first on player 1. Touches go to the touchscreen (dm_touch_set), normalized to the window.
@@ -10,6 +11,7 @@
 #include "../host/dm_input.h"
 #include "../host/front.h"
 #include "../host/hle.h"
+#include "../host/romfs_image.h"
 #include <android/log.h>
 #include <android/asset_manager.h>
 #include <android/configuration.h>
@@ -130,17 +132,28 @@ static void boot(void) {
     fprintf(stderr, "boot: game language %s\n", getenv("DM_LANG") ? getenv("DM_LANG") : "en-US");
     char dm[600]; snprintf(dm, sizeof dm, "%s/dm", g_int);
     unpack_dm(act->assetManager, dm);
-    char romfs[600]; snprintf(romfs, sizeof romfs, "%s/romfs", g_ext);
-    if (!romfs_ok(romfs)) {
-        LOG("[RED] no game data: %s/%s is missing. Copy the game's RomFS there (dm/android/tools/build_apk.py --push, or adb push <romfs> %s) and start the app again",
-            romfs, DM_GAME_ROMFS_MARKER, romfs);
-        return;
+    char romfs[600]; snprintf(romfs, sizeof romfs, "%s/romfs.img", g_ext);
+    romfs_img *im = romfs_image_open(romfs);
+    if (im) romfs_image_close(im);
+    else {
+        snprintf(romfs, sizeof romfs, "%s/romfs", g_ext);
+        if (!romfs_ok(romfs)) {
+            LOG("[RED] no game data: neither a complete %s/romfs.img nor %s/%s. Copy the game's RomFS there (dm/android/tools/build_apk.py --push) and start the app again",
+                g_ext, romfs, DM_GAME_ROMFS_MARKER);
+            return;
+        }
     }
+    LOG("game data: %s", romfs);
     setenv("DM_ROMFS", romfs, 0);
     snprintf(p, sizeof p, "%s/save", g_int); mkdirs(p); setenv("DM_SAVE", p, 0);
     snprintf(p, sizeof p, "%s/temp", g_int); mkdirs(p); setenv("DM_TEMP", p, 0);
     snprintf(p, sizeof p, "%s/shader_map.tsv", dm); setenv("DM_NVN_SHMAP", p, 0);
     snprintf(p, sizeof p, "%s/font", dm); setenv("DM_FONT_DIR", p, 0);
+    snprintf(p, sizeof p, "%s/font/standard.ttf", dm); struct stat fs;
+    if (stat(p, &fs)) {   // no standard font packed (upstream's is macOS's Arial Unicode): the first of Android's own TTFs that exists
+        static const char *sys[] = {"/system/fonts/NotoSans-Regular.ttf", "/system/fonts/Roboto-Regular.ttf", "/system/fonts/DroidSans.ttf"};
+        for (unsigned i = 0; i < sizeof sys / sizeof *sys; i++) if (!stat(sys[i], &fs)) { setenv("DM_SHARED_FONT", sys[i], 0); LOG("standard shared font: %s (none packed)", sys[i]); break; }
+    }
     snprintf(p, sizeof p, "%s/aoc", g_ext); struct stat st; if (!stat(p, &st)) setenv("DM_AOC_DIR", p, 0);
     if (chdir(g_int)) LOG("[RED] cannot enter %s", g_int);
     g_argv[0] = strdup("dmhost"); g_argv[1] = strdup(dm);

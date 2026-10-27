@@ -12,6 +12,9 @@
 # PLATFORM = 'mac-app' / --platform mac-app: everything 'mac' builds, then a self-contained, double-clickable Mac app of the game (dm/mac/pack_app.py) in the NSP folder, <game name>.app (OUT_IPA / -o
 #   names another path): the launcher dm/mac/launcher.c, the Mac host, the RomFS (APFS clones on the build's volume), the Mac shader libraries, the DLC and the rewritten modules inside it; the save
 #   in ~/Library/Application Support/nxnative/<title ID>/, the log in ~/Library/Logs/nxnative/<title ID>.log. Signed ad-hoc, or with MAC_SIGN / --mac-sign; no hardened runtime, no notarization.
+# PLATFORM = 'android' / --platform android: an Android APK (dm/android/tools/build_apk.py) — the steps up to the rewrite, with the modules rewritten for Android (DM_TARGET=android, into
+#   <id>_build/patched_<version>_android), then the host built with the NDK and the APK packed and signed with the Android debug key; --push installs it and copies the RomFS to the device
+#   (adb). The Android host has no graphics backend yet (dm/android/gfx/nvn_null.c: the game runs, nothing is drawn), so no shaders are made; runs on Linux or a Mac (.NET, the NDK, the SDK).
 # Two ways to run it: open this file in Spyder and press F5 (it uses the values under "Settings" below; an empty NSP folder or prod.keys is asked for at run time);
 #   or in a terminal: python3 scripts/build_ipa_from_nsp.py <NSP folder> -k <prod.keys> [options] (values given on the command line override "Settings", -h lists every option;
 #   without keyboard input a missing value is not asked for but reported as an error; exit code 0 on success, 1 on error, 130 when interrupted). Command-line options entered in Spyder's run configuration work the same way.
@@ -845,6 +848,16 @@ def check_prereqs(env, xlate, mac=False):   # mac: a Mac-only build (PLATFORM 'm
     if not xlate.exists(): raise BuildError(f'the shader translator is missing from the repository: {xlate}')
     sc = env.get('SPIRV_CROSS', str(xlate.parent.parent / 'spirv_cross_bin/spirv-cross'))
     if not shutil.which(sc, path=env.get('PATH')): raise BuildError(f'spirv-cross is missing or not executable: {sc}')
+
+
+def check_prereqs_android(env):   # --platform android: the rewrite's Python modules and nx_extract's .NET; the NDK and SDK as build_apk.py finds them
+    missing = [m for m in ('lz4.block', 'capstone', 'fontTools') if not _importable(m)] + ([] if _importable('compression.zstd') or _importable('backports.zstd') else ['backports.zstd'])
+    if missing: raise BuildError(f'the current Python ({sys.executable}) is missing modules: {", ".join(missing)} (pip install lz4 capstone fonttools backports.zstd; backports.zstd only before Python 3.14)')
+    gone = [f'{t} ({how})' for t, how in {'dotnet': '.NET SDK 10', 'zstd': 'zstd', 'cmake': 'cmake', 'ninja': 'ninja', 'keytool': 'a JDK'}.items() if not shutil.which(t, path=env['PATH'])]
+    if gone: raise BuildError('tools not found: ' + ', '.join(gone))
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'dm/android/tools')); import build_apk
+    try: build_apk.sdk_paths()
+    except build_apk.BuildError as e: raise BuildError(str(e)) from e
 
 
 def _importable(m):
@@ -1835,9 +1848,10 @@ def parse_args(argv):
     ap.add_argument('--app-name', help='app name on the home screen (default: the game name in the base NSP)')
     ap.add_argument('--bundle-id', help='the app\'s bundle ID (default: saved Xcode ID when preparing again, else org.nxnative.<base game title ID in lowercase>)')
     ap.add_argument('--prepare-xcode', action='store_true', help='prepare a per-game Xcode project and add it to the shared workspace instead of packing an IPA (requires keeping extracted files)')
-    ap.add_argument('--platform', choices=('ios', 'mac', 'mac-app'), help='ios = the IPA (or the Xcode project); mac = for development: build only what running the game on this Mac needs (the Mac shaders and the Mac host, '
+    ap.add_argument('--platform', choices=('ios', 'mac', 'mac-app', 'android'), help='android = an Android APK (dm/android/tools/build_apk.py); ios = the IPA (or the Xcode project); mac = for development: build only what running the game on this Mac needs (the Mac shaders and the Mac host, '
                     'no iOS shaders, Xcode project or IPA), keep the extracted files and print the command that runs the game; mac-app = what mac builds, then a self-contained, double-clickable '
                     'Mac app of the game (default: <game name>.app in the NSP folder, -o names another) (default: the PLATFORM setting, ios)')
+    ap.add_argument('--push', action='store_true', help='--platform android: install the APK on the connected device and copy the RomFS to it (adb)')
     ap.add_argument('--mac-sign', help='--platform mac-app: the codesign identity for the app, e.g. "Developer ID Application: <name> (<team>)" (default: the MAC_SIGN setting, else ad-hoc)')
     ap.add_argument('--team-id', help='Apple developer team ID (default: TEAM_ID setting, DM_TEAM_ID environment, or saved Xcode selection)')
     ap.add_argument('--xcode-workspace', help='workspace collecting prepared games (default: NxNative.xcworkspace beside the NSP folder; use with --prepare-xcode)')
@@ -1893,7 +1907,10 @@ def main(args=None):
     repo = find_repo(here)
     prepare_xcode = args.prepare_xcode or PREPARE_XCODE
     platform = args.platform or PLATFORM
-    if platform not in ('ios', 'mac', 'mac-app'): raise BuildError(f'PLATFORM / --platform must be ios, mac or mac-app: {platform}')
+    if platform not in ('ios', 'mac', 'mac-app', 'android'): raise BuildError(f'PLATFORM / --platform must be ios, mac, mac-app or android: {platform}')
+    android = platform == 'android'   # an APK: the rewrite for Android, the NDK host and the APK; no shaders yet (the Android host has no graphics backend) and nothing that runs the Mac host
+    if android and prepare_xcode: raise BuildError('--prepare-xcode makes an iPhone project: it cannot be combined with --platform android')
+    if args.push and not android: raise BuildError('--push installs an Android APK: it needs --platform android')
     mac = platform in ('mac', 'mac-app')   # the Mac's shaders and host only: no iOS shaders, Xcode project or IPA (mac_run prints the command; mac-app packs a Mac app, mac_app)
     mac_pack = platform == 'mac-app'
     if args.mac_sign and not mac_pack: raise BuildError('--mac-sign signs the Mac app: it needs --platform mac-app')
@@ -1964,6 +1981,8 @@ def main(args=None):
     out_ipa = Path(os.path.expanduser(args.out or OUT_IPA)).resolve() if (args.out or OUT_IPA) else nsp_dir / g.get('ipa')   # by default in the NSP folder, next to the NSPs and <id>_build/
     if shadowed and not (args.out or OUT_IPA): out_ipa = out_ipa.with_name(out_ipa.stem + '-provisional.ipa')   # never over the IPA of the game's real profile
     if mac_pack and (args.out or OUT_IPA) and out_ipa.suffix != '.app': raise BuildError(f'the Mac app (-o / OUT_IPA) must end in .app: {out_ipa}')
+    if android and not (args.out or OUT_IPA): out_ipa = out_ipa.with_suffix('.apk')
+    if android and out_ipa.suffix != '.apk': raise BuildError(f'the Android app (-o / OUT_IPA) must end in .apk: {out_ipa}')
     work = nsp_dir / f'{g.id}_build'
     project = work / 'xcode/DmIOS.xcodeproj'
     workspace = Path(os.path.expanduser(args.xcode_workspace or XCODE_WORKSPACE)).resolve() if (args.xcode_workspace or XCODE_WORKSPACE) else nsp_dir.parent / 'NxNative.xcworkspace'
@@ -1984,14 +2003,15 @@ def main(args=None):
     # DM_GAME picks the profile; DM_ROOT / WORK point at <id>_build: the tools' default paths and temporary directories all stay inside it
     env.update(DM_GAME=g.id, DM_ROOT=str(work), WORK=str(work / 'tmp'))
     logs = work / 'logs'
-    check_prereqs(env, xlate, mac)
+    if android: check_prereqs_android(env)
+    else: check_prereqs(env, xlate, mac)
     picks = pick_nsps(fam, have, versions)
 
     ex = work / 'extract'; ex.mkdir(parents=True, exist_ok=True); (work / 'tmp').mkdir(exist_ok=True)
     gb = extract_bytes(picks, False) / 2**30 + 6   # every merged image is complete, including on APFS; shader cache + slack
     if free_gb(work) < gb and not all((ex / v).exists() for v in versions): raise BuildError(f'less than {gb:.0f} GB free on the volume of {work}')
-    heapck = provisional and HEAP_CHECK and not args.no_heap_check and not heap_checked(g)   # the heap check, when the game needs one (once per provisional profile: it stamps the profile)
-    PROG.plan(1 + len(versions) + bool(fam['dlc']) + 4 - (prepare_xcode or (mac and not mac_pack)))   # prepare Xcode (a Mac-only build: the Mac host) replaces app build + IPA pack with one stage (a Mac app: Mac host + Mac app)
+    heapck = provisional and HEAP_CHECK and not args.no_heap_check and not heap_checked(g) and not android   # Android: the modules are not the Mac host's   # the heap check, when the game needs one (once per provisional profile: it stamps the profile)
+    PROG.plan(1 + len(versions) + bool(fam['dlc']) + (2 if android else 4 - (prepare_xcode or (mac and not mac_pack))))   # Android: rewrite + APK   # prepare Xcode (a Mac-only build: the Mac host) replaces app build + IPA pack with one stage (a Mac app: Mac host + Mac app)
     PROG.stage('build nx_extract')
     nx = build_nx_extract(repo, work, logs, env)
     PROG.end()
@@ -2024,10 +2044,10 @@ def main(args=None):
     uedec = gfx == 'nvn' and src['ue_decode'][0]   # Unreal Engine shaders, Oodle-compressed in the paks' shader code archives, decoded in the Mac host (decode_ue_shaders)
     if gfx == 'vulkan': say(f'Vulkan game ({src["graphics"][1]}): vk_shaders.py translates the shaders instead of the NVN shader chain')
     if gfx == 'gl': say(f'OpenGL game ({src["graphics"][1]}): gl_shaders.py translates the shaders instead of the NVN shader chain')
-    if gfx == 'nvn': check_metal(py, repo, env)   # before the captures and the shader split, which take minutes
+    if gfx == 'nvn' and not android: check_metal(py, repo, env)   # before the captures and the shader split, which take minutes
     for on, k in ((glslc, 'glslc_capture'), (vkcap, 'vk_capture'), (glcap, 'gl_capture'), (uedec, 'ue_decode'), (gfx == 'nvn' and src['oodle_packs'][0], 'oodle_packs'), (gfx == 'nvn' and src['ue_legacy'][0], 'ue_legacy')):
         if on: say(src[k][1])
-    PROG.add(glslc + vkcap + glcap + uedec + (gfx == 'nvn'))
+    if not android: PROG.add(glslc + vkcap + glcap + uedec + (gfx == 'nvn'))
     aoc = extract_aoc(nx, keys, repo, work, app, fam, logs)
     dlc_roms = sorted(p for p in aoc.iterdir() if p.is_dir() or p.suffix == '.img') if aoc else []
     base = next((dirs[v] for v in versions if picks[v][1] is None), dirs[versions[0]])   # the folder the base game was extracted to alone
@@ -2049,7 +2069,8 @@ def main(args=None):
     say(f'game language: {lang} ({dict(nacp.LANGUAGES)[lang]})' + (f', the game has no {want_lang}' if lang != want_lang else '')
         + (f'; the game\'s languages: {" ".join(have)}' if have else '; the control data lists no languages (not checked)') + (' (DM_LANG=<code> in the run command changes it)' if mac else ' (DM_LANG=<code> in the app\'s Documents/env.txt changes it)'))
 
-    patched = work / f'patched_{pkg_ver}'
+    patched = work / f'patched_{pkg_ver}{"_android" if android else ""}'
+    if android: env['DM_TARGET'] = 'android'   # thread slots through bionic (patch_nso.py emit_tsd_base); its own output folder, beside the Apple rewrite
     g = rewrite(py, repo, game / 'ExeFS', patched, env, logs, g, provisional)
     chain_header(py, repo, env, logs)   # before any host is built
     if provisional or derived:   # the keys that need the rewritten modules, then (provisional) the heap check (both only change keys the host is built with, not the rewrite or the shader steps)
@@ -2058,6 +2079,22 @@ def main(args=None):
         if provisional and heapck and pg.heap_check_needed(game / 'ExeFS'):
             if apple_silicon(): PROG.add(1); g = heap_check(repo, game, patched, work, env, logs, g)
             else: say('no heap check: it boots the game in the Mac host, which needs a Mac with Apple silicon; the profile keeps its guessed heap keys')
+    if android:   # the APK: no shaders yet (the null graphics device draws nothing), nothing that boots the Mac host
+        if glslc or vkcap or glcap or uedec: say('[RED] this game makes shaders at run time; the Android host draws nothing yet, so they are not captured')
+        icon = next((d / 'icon.jpg' for d in (game, base) if (d / 'icon.jpg').exists()), None)
+        sys.path.insert(0, str(repo / 'dm/android/tools')); import build_apk
+        PROG.stage('Android APK')
+        try:
+            build_apk.build(g.id, patched, rfs.source(game), out_ipa, app_name, app_version or '1.0', args.bundle_id or BUNDLE_ID or None, icon,
+                            aoc if aoc else None, args.env_file or DM_ENV_FILE or None, None, work / 'android', args.push, env)
+        except build_apk.BuildError as e: raise BuildError(str(e)) from e
+        PROG.end()
+        rmtree(work / 'tmp')
+        if not keep and args.push: rmtree(ex)   # without --push the RomFS still has to go to the device from there
+        elif not keep: say(f'keeping the extracted game files: the RomFS goes to the device from {rfs.source(game)} (run again with --push)')
+        say(f'done: {out_ipa}' + ('' if args.push else f'; install it with adb install {out_ipa}, then copy the RomFS (run again with --push)'))
+        report_profile_status(g, reg, pkg_ver, derived, provisional, 'APK')
+        return
     if glslc: capture_glslc(repo, {v: dirs[v] for v in sv}, pkg_ver, patched, work, env, logs, g)
     if uedec: decode_ue_shaders(repo, {v: dirs[v] for v in sv}, pkg_ver, patched, work, env, logs, g)
     sh = work / 'shader'
