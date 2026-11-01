@@ -45,7 +45,8 @@ static pthread_mutex_t g_mu;           // every entry point; held from mtl_sub_b
 static pthread_once_t g_once = PTHREAD_ONCE_INIT;
 static VkInstance g_inst; static VkPhysicalDevice g_pd; static VkDevice g_dev; static VkQueue g_q; static uint32_t g_qf;
 static VkPhysicalDeviceMemoryProperties g_memp; static VkPhysicalDeviceProperties g_props;
-static int g_bc, g_astc, g_validate, g_aniso, g_mirror_clamp;
+static int g_bc, g_astc, g_validate, g_aniso, g_mirror_clamp, g_draw_params;
+static VkPhysicalDeviceFeatures g_feat;
 static VkDebugUtilsMessengerEXT g_msgr;
 static uint64_t g_fence;               // submissions committed (all complete)
 
@@ -113,21 +114,26 @@ static void mem_free(vmem *a) {
 typedef struct { VkBuffer buf; vmem m; VkDeviceSize size, used; } chunk;
 static chunk g_chunk[64]; static int g_nchunk;
 typedef struct { VkBuffer buf; VkDeviceSize off; uint8_t *p; } stage_t;
-static stage_t stage(VkDeviceSize n) {
-    n = (n + 15) & ~(VkDeviceSize)15;
-    for (int i = 0; i < g_nchunk; i++) if (g_chunk[i].size - g_chunk[i].used >= n) {
-        chunk *c = &g_chunk[i]; stage_t s = {c->buf, c->used, (uint8_t *)c->m.map + c->used}; c->used += n; return s;
+static void stage_cache_clear(void);
+static stage_t stage_al(VkDeviceSize n, VkDeviceSize al) {   // n bytes at an offset aligned to al (a power of two)
+    n = (n + 15) & ~(VkDeviceSize)15; if (al < 16) al = 16;
+    for (int i = 0; i < g_nchunk; i++) {
+        chunk *c = &g_chunk[i]; VkDeviceSize o = (c->used + al - 1) & ~(al - 1);
+        if (o + n <= c->size) { stage_t s = {c->buf, o, (uint8_t *)c->m.map + o}; c->used = o + n; return s; }
     }
     if (g_nchunk == 64) VDIE("staging: more than 64 chunks in one submission");
     chunk *c = &g_chunk[g_nchunk++]; c->size = n > (16 << 20) ? n : 16 << 20; c->used = 0;
-    VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, c->size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, NULL};
+    VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, c->size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
+                             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, NULL};
     VKC(vkCreateBuffer(g_dev, &bi, NULL, &c->buf));
     VkMemoryRequirements rq; vkGetBufferMemoryRequirements(g_dev, c->buf, &rq);
     c->m = mem_alloc(rq, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT, 1);
     VKC(vkBindBufferMemory(g_dev, c->buf, c->m.mem, c->m.off));
     stage_t st = {c->buf, 0, c->m.map}; c->used = n; return st;
 }
+static stage_t stage(VkDeviceSize n) { return stage_al(n, 16); }
 static void stage_reset(void) {
+    stage_cache_clear();
     for (int i = 0; i < g_nchunk; i++) {
         if (g_chunk[i].size > (16 << 20)) { vkDestroyBuffer(g_dev, g_chunk[i].buf, NULL); mem_free(&g_chunk[i].m); g_chunk[i--] = g_chunk[--g_nchunk]; continue; }   // big ones are not kept
         g_chunk[i].used = 0;
@@ -135,13 +141,14 @@ static void stage_reset(void) {
 }
 
 // ---------- Transient objects (views, framebuffers) destroyed when the submission completed ----------
-typedef struct { int kind; uint64_t h; } trans;   // 0 image view, 1 framebuffer
+typedef struct { int kind; uint64_t h; } trans;   // 0 image view, 1 framebuffer, 2 buffer view
 static trans *g_trans; static int g_ntrans, g_captrans;
 static void trans_add(int kind, uint64_t h) { if (g_ntrans == g_captrans) { g_captrans = g_captrans ? 2 * g_captrans : 64; g_trans = realloc(g_trans, (size_t)g_captrans * sizeof *g_trans); } g_trans[g_ntrans++] = (trans){kind, h}; }
 static void trans_free(void) {
     for (int i = 0; i < g_ntrans; i++) {
         if (g_trans[i].kind == 0) vkDestroyImageView(g_dev, (VkImageView)g_trans[i].h, NULL);
-        else vkDestroyFramebuffer(g_dev, (VkFramebuffer)g_trans[i].h, NULL);
+        else if (g_trans[i].kind == 1) vkDestroyFramebuffer(g_dev, (VkFramebuffer)g_trans[i].h, NULL);
+        else vkDestroyBufferView(g_dev, (VkBufferView)g_trans[i].h, NULL);
     }
     g_ntrans = 0;
 }
@@ -199,10 +206,17 @@ static void dev_init(void) {
     want.textureCompressionBC = have.textureCompressionBC; want.textureCompressionASTC_LDR = have.textureCompressionASTC_LDR;
     want.samplerAnisotropy = have.samplerAnisotropy; want.independentBlend = have.independentBlend; want.imageCubeArray = have.imageCubeArray;
     want.fragmentStoresAndAtomics = have.fragmentStoresAndAtomics; want.shaderStorageImageWriteWithoutFormat = have.shaderStorageImageWriteWithoutFormat;
+    want.vertexPipelineStoresAndAtomics = have.vertexPipelineStoresAndAtomics; want.depthClamp = have.depthClamp; want.fillModeNonSolid = have.fillModeNonSolid;
+    want.dualSrcBlend = have.dualSrcBlend; want.robustBufferAccess = have.robustBufferAccess;   // robust access: a binding smaller than the shader's view of it reads zeros, as NVN's unbound memory does
+    want.shaderStorageImageReadWithoutFormat = have.shaderStorageImageReadWithoutFormat; want.largePoints = have.largePoints; want.shaderImageGatherExtended = have.shaderImageGatherExtended;
+    g_feat = want;
     g_bc = have.textureCompressionBC && !getenv("DM_VK_NO_BC"); g_astc = have.textureCompressionASTC_LDR; g_aniso = have.samplerAnisotropy;
     float prio = 1;
     VkDeviceQueueCreateInfo qi = {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, NULL, 0, g_qf, 1, &prio};
-    VkDeviceCreateInfo dci = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, NULL, 0, 1, &qi, 0, NULL, ndx, dext, &want};
+    VkPhysicalDeviceShaderDrawParametersFeatures dpf = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DRAW_PARAMETERS_FEATURES, NULL, 0};
+    VkPhysicalDeviceFeatures2 f2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &dpf, {0}}; vkGetPhysicalDeviceFeatures2(g_pd, &f2);
+    g_draw_params = dpf.shaderDrawParameters;   // base vertex / instance in the shader (the translator's instance index)
+    VkDeviceCreateInfo dci = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &dpf, 0, 1, &qi, 0, NULL, ndx, dext, &want};
     VKC(vkCreateDevice(g_pd, &dci, NULL, &g_dev));
     vkGetDeviceQueue(g_dev, g_qf, 0, &g_q);
     VkCommandPoolCreateInfo pci = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, NULL, VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, g_qf};
@@ -242,7 +256,10 @@ static void posts_run(void) {
     }
     g_npost = 0; g_readbacks = 0;
 }
+static void desc_reset(void);
+static void pass_end(void);
 static void flush(void) {   // submit what is recorded, wait, then the CPU-visible results and the transient objects
+    pass_end();
     if (!g_rec) { posts_run(); return; }
     VKC(vkEndCommandBuffer(g_cb)); g_rec = 0;
     VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, 0, NULL, NULL, 1, &g_cb, 0, NULL};
@@ -251,7 +268,7 @@ static void flush(void) {   // submit what is recorded, wait, then the CPU-visib
     if (r == VK_TIMEOUT) VDIE("the GPU did not finish a submission in 10 s");
     VKC(r); VKC(vkResetFences(g_dev, 1, &g_done));
     VKC(vkResetCommandBuffer(g_cb, 0));
-    posts_run(); trans_free(); stage_reset();
+    posts_run(); trans_free(); stage_reset(); desc_reset();
 }
 
 // ---------- Textures ----------
@@ -263,7 +280,7 @@ typedef struct vtex {
 } vtex;
 static nvn_hmap g_tex = {.klen = 8};
 static uint64_t g_sub;   // recorded submissions (counted at mtl_sub_begin): a CPU-written texture is uploaded once in each
-static int g_red_draw, g_red_fmt, g_red_mask;
+static int g_red_fmt, g_red_mask;
 static VkFormat bc_decoded(int bc, VkFormat f) {
     switch (bc) {
         case 4: return f == VK_FORMAT_BC4_SNORM_BLOCK ? VK_FORMAT_R8_SNORM : VK_FORMAT_R8_UNORM;
@@ -294,8 +311,8 @@ static vtex *tex_make(const tex_t *t) {
     vtex *v = calloc(1, sizeof *v); v->serial = t->serial; v->t = *t; v->f = f;
     v->w = d->width ? d->width : 1; v->h = d->height ? d->height : 1; v->d = 1; v->layers = 1; v->levels = d->levels ? d->levels : 1; v->type = VK_IMAGE_TYPE_2D;
     switch (d->target) {
-        case NVN_TEXTURE_TARGET_1D: v->h = 1; break;
-        case NVN_TEXTURE_TARGET_1D_ARRAY: v->layers = v->h; v->h = 1; break;
+        case NVN_TEXTURE_TARGET_1D: v->h = 1; v->type = VK_IMAGE_TYPE_1D; break;
+        case NVN_TEXTURE_TARGET_1D_ARRAY: v->layers = v->h; v->h = 1; v->type = VK_IMAGE_TYPE_1D; break;
         case NVN_TEXTURE_TARGET_3D: v->type = VK_IMAGE_TYPE_3D; v->d = d->depth ? d->depth : 1; break;
         case NVN_TEXTURE_TARGET_2D_ARRAY: case NVN_TEXTURE_TARGET_2D_MULTISAMPLE_ARRAY: v->layers = d->depth ? d->depth : 1; break;
         case NVN_TEXTURE_TARGET_CUBEMAP: v->layers = 6; v->cflags = VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT; break;
@@ -303,6 +320,7 @@ static vtex *tex_make(const tex_t *t) {
         default: break;
     }
     v->samples = d->samples > 1 ? (VkSampleCountFlagBits)d->samples : VK_SAMPLE_COUNT_1_BIT;
+    if (v->type == VK_IMAGE_TYPE_2D && v->layers >= 6 && v->layers % 6 == 0 && v->w == v->h && v->samples == 1) v->cflags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
     v->fmt = f.vk;
     if (f.bc && !g_bc) { v->fmt = bc_decoded(f.bc, f.vk); v->decoded = 1; }
     if (f.vk >= VK_FORMAT_ASTC_4x4_UNORM_BLOCK && f.vk <= VK_FORMAT_ASTC_12x12_SRGB_BLOCK && !g_astc) VLOG("[RED] ASTC texture ser=%llu on a device without ASTC: not sampled right", (unsigned long long)t->serial);
@@ -324,7 +342,7 @@ static vtex *tex_make(const tex_t *t) {
     v->m = mem_alloc(rq, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0);
     VKC(vkBindImageMemory(g_dev, v->img, v->m.mem, v->m.off));
     // into GENERAL, contents zero (a texture the game never wrote reads as 0, as the GPU's fresh memory does)
-    rec_begin();
+    rec_begin(); pass_end();
     VkImageMemoryBarrier ib = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, 0, VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
                                VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, v->img, {v->aspect, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS}};
     vkCmdPipelineBarrier(g_cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &ib);
@@ -385,6 +403,7 @@ static stage_t convert(const vtex *v, const uint8_t *src, uint32_t blocks_w, uin
 }
 static void lvl_dims(const vtex *v, unsigned l, uint32_t *w, uint32_t *h, uint32_t *d) { *w = v->w >> l ? v->w >> l : 1; *h = v->h >> l ? v->h >> l : 1; *d = v->d >> l ? v->d >> l : 1; }
 static void upload(vtex *v) {   // the whole texture from its storage in guest memory
+    pass_end();
     const tex_t *t = &v->t; const nvn_texdesc *d = &t->d;
     if (!t->mem || v->samples > 1) return;
     int bw, bh, bpb = nvn_fmt_bpb(d->format, &bw, &bh); if (!bpb) return;
@@ -431,7 +450,7 @@ static vtex *tex_use(const tex_t *t, int dst) {
 
 // ---------- Views and one-attachment render passes (clears) ----------
 static VkImageView view_make(const vtex *v, unsigned level, unsigned layer, unsigned nlayers, VkImageAspectFlags aspect) {
-    VkImageViewType vt = v->type == VK_IMAGE_TYPE_3D ? VK_IMAGE_VIEW_TYPE_3D : nlayers > 1 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
+    VkImageViewType vt = v->type == VK_IMAGE_TYPE_3D ? VK_IMAGE_VIEW_TYPE_3D : v->type == VK_IMAGE_TYPE_1D ? (nlayers > 1 ? VK_IMAGE_VIEW_TYPE_1D_ARRAY : VK_IMAGE_VIEW_TYPE_1D) : nlayers > 1 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
     VkImageViewCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, NULL, 0, v->img, vt, v->fmt, {0}, {aspect, level, 1, layer, nlayers}};
     VkImageView iv; VKC(vkCreateImageView(g_dev, &ci, NULL, &iv)); trans_add(0, (uint64_t)iv); return iv;
 }
@@ -447,6 +466,7 @@ static VkRenderPass rp_get(VkFormat f, VkSampleCountFlagBits s, int depth) {
 }
 // Clear a rectangle of one level and layers of a texture through a render pass (the scissor and partial regions vkCmdClear*Image cannot do)
 static void clear_rect(const vtex *v, unsigned level, unsigned layer, unsigned nlayers, VkRect2D rc, const VkClearValue *cv, VkImageAspectFlags aspect) {
+    pass_end();
     uint32_t w, h, d; lvl_dims(v, level, &w, &h, &d);
     if (v->type == VK_IMAGE_TYPE_3D) { layer = 0; nlayers = 1; }   // stage 1: a 3D target's slice 0
     int x0 = rc.offset.x < 0 ? 0 : rc.offset.x, y0 = rc.offset.y < 0 ? 0 : rc.offset.y;
@@ -467,7 +487,8 @@ static void clear_rect(const vtex *v, unsigned level, unsigned layer, unsigned n
 }
 
 // ---------- Samplers (one per distinct parameter set) and sampled views (one per texture, view and swizzle) ----------
-static nvn_hmap g_samp = {.klen = sizeof(samp_par)};
+typedef struct { samp_par p; int cmp; } skey;
+static nvn_hmap g_samp = {.klen = sizeof(skey)};
 
 static VkSamplerAddressMode wrap_mode(int w) {
     switch (w) {
@@ -482,19 +503,19 @@ static VkBorderColor border_color(const float b[4]) {   // Vulkan 1.1 has three 
     if (b[3] < 0.5f) return VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
     return b[0] + b[1] + b[2] > 1.5f ? VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE : VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK;
 }
-static VkSampler sampler_get(const samp_par *p) {
-    samp_par k; memset(&k, 0, sizeof k); k = *p;
+static VkSampler sampler_get(const samp_par *p, int force_cmp) {   // force_cmp: the shader compares (a shadow sampler), whatever the sampler's own compare mode
+    skey k; memset(&k, 0, sizeof k); k.p = *p; k.cmp = force_cmp;
     VkSampler sm = (VkSampler)nvn_hm_get(&g_samp, &k); if (sm) return sm;
     int mip = p->minf >= 2, lmin = p->minf == 1 || p->minf == 3 || p->minf == 5, lmip = p->minf == 4 || p->minf == 5;
     float lmn = p->lod_min, lmx = mip ? p->lod_max : lmn + 0.25f;   // no mipmapping: the base level only (Vulkan's recipe: maxLod = minLod + 0.25 with NEAREST)
     VkSamplerCreateInfo ci = {VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO, NULL, 0, p->magf ? VK_FILTER_LINEAR : VK_FILTER_NEAREST, lmin ? VK_FILTER_LINEAR : VK_FILTER_NEAREST,
                               lmip ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST, wrap_mode(p->ws), wrap_mode(p->wt), wrap_mode(p->wr), p->lod_bias,
-                              g_aniso && p->aniso > 1, p->aniso > 16 ? 16 : p->aniso < 1 ? 1 : p->aniso, p->cmp_mode == 1, p->cmp_func >= 1 && p->cmp_func <= 8 ? (VkCompareOp)(p->cmp_func - 1) : VK_COMPARE_OP_ALWAYS,
+                              g_aniso && p->aniso > 1, p->aniso > 16 ? 16 : p->aniso < 1 ? 1 : p->aniso, p->cmp_mode == 1 || force_cmp, p->cmp_func >= 1 && p->cmp_func <= 8 ? (VkCompareOp)(p->cmp_func - 1) : VK_COMPARE_OP_LESS_OR_EQUAL,
                               lmn, lmx < lmn ? lmn : lmx, border_color(p->border), VK_FALSE};
     VKC(vkCreateSampler(g_dev, &ci, NULL, &sm)); nvn_hm_put(&g_samp, &k, (void *)sm); return sm;
 }
 // A view to sample: the texture's levels / layers / format as the NVN view narrows them, the format table's swizzle composed with the view's or the texture's own
-typedef struct { uint64_t serial; view_t v; uint16_t swz; uint8_t has, stencil; } vkey;
+typedef struct { uint64_t serial; view_t v; uint16_t swz; uint8_t has, stencil; int32_t want; } vkey;
 static nvn_hmap g_views = {.klen = sizeof(vkey)};   // (declared before tex_free)
 static VkComponentSwizzle nvn_swz(int c) { static const VkComponentSwizzle m[6] = {VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ONE, VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_G, VK_COMPONENT_SWIZZLE_B, VK_COMPONENT_SWIZZLE_A}; return c >= 0 && c < 6 ? m[c] : VK_COMPONENT_SWIZZLE_IDENTITY; }
 static VkComponentSwizzle compose(VkComponentSwizzle outer, const VkComponentSwizzle inner[4], int self) {   // outer picks a component of what inner gives
@@ -512,14 +533,26 @@ static VkImageViewType view_type(const vtex *v, int target, unsigned nlayers) {
         default: return v->type == VK_IMAGE_TYPE_3D ? VK_IMAGE_VIEW_TYPE_3D : nlayers > 1 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
     }
 }
-static VkImageView sampled_view(vtex *v, const view_t *vw, int has) {
-    vkey k; memset(&k, 0, sizeof k); k.serial = v->serial; k.has = (uint8_t)has; if (has) k.v = *vw; k.swz = v->t.set_swz ? v->t.swz : 0; k.stencil = v->t.stencil;
+// want: the view type the shader declares (Vulkan requires it to match), or -1 for the texture's own; VK_NULL_HANDLE when the texture cannot be seen that way
+static VkImageView sampled_view(vtex *v, const view_t *vw, int has, int want) {
+    vkey k; memset(&k, 0, sizeof k); k.serial = v->serial; k.has = (uint8_t)has; if (has) k.v = *vw; k.swz = v->t.set_swz ? v->t.swz : 0; k.stencil = v->t.stencil; k.want = want;
     VkImageView iv = (VkImageView)nvn_hm_get(&g_views, &k); if (iv) return iv;
     unsigned level = has && vw->set_levels ? vw->base_level : 0, nlev = has && vw->set_levels && vw->nlevels ? vw->nlevels : v->levels - level;
     unsigned layer = has && vw->set_layers ? vw->min_layer : 0, nl = has && vw->set_layers && vw->nlayers ? vw->nlayers : (v->type == VK_IMAGE_TYPE_3D ? 1 : v->layers - layer);
     int target = has && vw->set_target ? vw->target : v->t.d.target;
-    VkImageViewType vt = view_type(v, target, nl);
+    VkImageViewType vt = v->type == VK_IMAGE_TYPE_1D ? (nl > 1 ? VK_IMAGE_VIEW_TYPE_1D_ARRAY : VK_IMAGE_VIEW_TYPE_1D) : view_type(v, target, nl);
     if ((vt == VK_IMAGE_VIEW_TYPE_CUBE && nl < 6) || (vt == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY && nl % 6)) vt = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+    if (want >= 0 && (VkImageViewType)want != vt) {   // the shader's type: the compatible conversions (2D <-> 1-layer 2D array, a 2D array of 6n square layers as cubes, a cube as its 6-layer array)
+        VkImageViewType w = (VkImageViewType)want; int cube = (v->cflags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) != 0;
+        if (w == VK_IMAGE_VIEW_TYPE_2D && (vt == VK_IMAGE_VIEW_TYPE_2D_ARRAY || vt == VK_IMAGE_VIEW_TYPE_CUBE || vt == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY) && v->type == VK_IMAGE_TYPE_2D) nl = 1;
+        else if (w == VK_IMAGE_VIEW_TYPE_2D_ARRAY && (vt == VK_IMAGE_VIEW_TYPE_2D || vt == VK_IMAGE_VIEW_TYPE_CUBE || vt == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY)) ;
+        else if (w == VK_IMAGE_VIEW_TYPE_1D_ARRAY && vt == VK_IMAGE_VIEW_TYPE_1D) ;
+        else if (w == VK_IMAGE_VIEW_TYPE_1D && vt == VK_IMAGE_VIEW_TYPE_1D_ARRAY) nl = 1;
+        else if (w == VK_IMAGE_VIEW_TYPE_CUBE && cube && nl >= 6) nl = 6;
+        else if (w == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY && cube && nl >= 6 && g_feat.imageCubeArray) nl -= nl % 6;
+        else return VK_NULL_HANDLE;
+        vt = w;
+    }
     if (vt == VK_IMAGE_VIEW_TYPE_CUBE) nl = 6;
     VkImageAspectFlags asp = v->aspect & VK_IMAGE_ASPECT_COLOR_BIT ? VK_IMAGE_ASPECT_COLOR_BIT : (v->t.stencil || (has && vw->set_dsmode && vw->dsmode == 1)) && (v->aspect & VK_IMAGE_ASPECT_STENCIL_BIT) ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_DEPTH_BIT;
     VkComponentMapping cm = {v->f.swz[0], v->f.swz[1], v->f.swz[2], v->f.swz[3]};
@@ -579,6 +612,7 @@ static void op_clear_tex(const p_clear_tex *c) {
     clear_rect(v, level, layer, n, (VkRect2D){{c->r.xoffset, c->r.yoffset}, {(uint32_t)c->r.width, (uint32_t)c->r.height}}, &cv, VK_IMAGE_ASPECT_COLOR_BIT);
 }
 static void op_copy_b2t(const p_copy_b2t *c) {
+    pass_end();
     vtex *v = tex_use(c->tex, 1); if (!v) return;
     int bw, bh, bpb = nvn_fmt_bpb(v->t.d.format, &bw, &bh); if (!bpb || !c->src) return;
     unsigned level, layer, n; view_range(v, &c->view, c->has_view, &level, &layer, &n);
@@ -593,6 +627,7 @@ static void op_copy_b2t(const p_copy_b2t *c) {
     barrier();
 }
 static void op_copy_t2b(const p_copy_b2t *c) {
+    pass_end();
     vtex *v = tex_use(c->tex, 0); if (!v || !c->src) return;
     if (v->decoded || v->f.expand) { static int n; if (n++ < 4) VLOG("[RED] texture-to-buffer copy from a converted texture ser=%llu (format %#x): skipped", (unsigned long long)v->serial, v->t.d.format); return; }
     int bw, bh, bpb = nvn_fmt_bpb(v->t.d.format, &bw, &bh); if (!bpb) return;
@@ -609,6 +644,7 @@ static void op_copy_t2b(const p_copy_b2t *c) {
     post_add((post_t){3, NULL, 0, 0, c->src, 0, s.p, brows, rb, (uint32_t)stride, slices, istride});
 }
 static void op_copy_t2t(const p_copy_t2t *c) {
+    pass_end();
     vtex *s = tex_use(c->src, 0), *d = tex_use(c->dst, 1); if (!s || !d) return;
     unsigned sl, sa, sn, dl, da, dn; view_range(s, &c->sv, c->has_sv, &sl, &sa, &sn); view_range(d, &c->dv, c->has_dv, &dl, &da, &dn);
     const NVNcopyRegion *sr = &c->sr, *dr = &c->dr;
@@ -631,7 +667,10 @@ static void op_copy_t2t(const p_copy_t2t *c) {
     }
     barrier();
 }
-static void cpu_buffer_op(void) { if (g_readbacks) flush(); }   // a buffer write after a pending readback: the readback lands first
+static void cpu_buffer_op(void) { if (g_readbacks) flush(); }
+static int state_op(uint32_t op, const void *a);
+static void op_draw(uint32_t op, const void *a, uint32_t size);
+static void op_dispatch(const p_dispatch *d);   // a buffer write after a pending readback: the readback lands first
 static void exec_list(const uint8_t *p, int depth) {
     for (int guard = 0; guard < 1 << 24; guard++) {
         op_hdr h; memcpy(&h, p, sizeof h);
@@ -643,10 +682,10 @@ static void exec_list(const uint8_t *p, int depth) {
             case OP_SIGNAL_EVENT: { volatile uint32_t *val; uint32_t m, v; memcpy(&val, a, 8); memcpy(&m, a + 8, 4); memcpy(&v, a + 12, 4); post_add((post_t){1, val, m, v, 0, 0, NULL, 0, 0, 0, 0, 0}); break; }
             case OP_REPORT_COUNTER: { uint64_t t, ad; memcpy(&t, a, 8); memcpy(&ad, a + 8, 8); post_add((post_t){2, NULL, 0, 0, ad, t, NULL, 0, 0, 0, 0, 0}); break; }
             case OP_FENCE_SYNC: { sync_t *s; memcpy(&s, a, 8); s->fence = g_fence + 1; s->fenced = 1; break; }
-            case OP_CLEAR_BUF: { cpu_buffer_op(); const p_clear_buf *cb = (const p_clear_buf *)a; uint32_t *d = (uint32_t *)(uintptr_t)cb->addr; for (uint64_t i = 0; i < cb->size / 4; i++) d[i] = cb->value; break; }
-            case OP_COPY_B2B: { cpu_buffer_op(); uint64_t s_, d, n; memcpy(&s_, a, 8); memcpy(&d, a + 8, 8); memcpy(&n, a + 16, 8); memmove((void *)(uintptr_t)d, (const void *)(uintptr_t)s_, n); break; }
-            case OP_UPDATE_UB: { cpu_buffer_op(); uint64_t d, n; memcpy(&d, a, 8); memcpy(&n, a + 8, 8); memcpy((void *)(uintptr_t)d, a + 16, n); break; }
-            case OP_SET_RT: memcpy(&S.rt, a, sizeof S.rt); S.has_rt = 1; break;
+            case OP_CLEAR_BUF: { cpu_buffer_op(); stage_cache_clear(); const p_clear_buf *cb = (const p_clear_buf *)a; uint32_t *d = (uint32_t *)(uintptr_t)cb->addr; for (uint64_t i = 0; i < cb->size / 4; i++) d[i] = cb->value; break; }
+            case OP_COPY_B2B: { cpu_buffer_op(); stage_cache_clear(); uint64_t s_, d, n; memcpy(&s_, a, 8); memcpy(&d, a + 8, 8); memcpy(&n, a + 16, 8); memmove((void *)(uintptr_t)d, (const void *)(uintptr_t)s_, n); break; }
+            case OP_UPDATE_UB: { cpu_buffer_op(); stage_cache_clear(); uint64_t d, n; memcpy(&d, a, 8); memcpy(&n, a + 8, 8); memcpy((void *)(uintptr_t)d, a + 16, n); break; }
+            case OP_SET_RT: pass_end(); memcpy(&S.rt, a, sizeof S.rt); S.has_rt = 1; break;
             case OP_SCISSOR: memcpy(&S.sc, a, sizeof S.sc); S.has_sc = 1; break;
             case OP_COPY_STRIDE: { const p_copy_stride *cs = (const p_copy_stride *)a; if (cs->image) S.copy_img_stride = cs->stride; else S.copy_stride = cs->stride; break; }
             case OP_CLEAR_COLOR: op_clear_color((const p_clear_color *)a); break;
@@ -655,15 +694,18 @@ static void exec_list(const uint8_t *p, int depth) {
             case OP_COPY_B2T: op_copy_b2t((const p_copy_b2t *)a); break;
             case OP_COPY_T2B: op_copy_t2b((const p_copy_b2t *)a); break;
             case OP_COPY_T2T: op_copy_t2t((const p_copy_t2t *)a); break;
-            case OP_DRAW: case OP_DRAW_IDX: case OP_DISPATCH: if (!g_red_draw++) VLOG("[RED] draws and dispatches are not executed yet (Vulkan backend stage 1): the picture is only clears and copies"); break;
-            default: break;
+            case OP_DRAW: case OP_DRAW_IDX: op_draw(h.op, a, h.size); break;
+            case OP_DISPATCH: op_dispatch((const p_dispatch *)a); break;
+            case OP_BARRIER: pass_end(); barrier(); break;
+            default: state_op(h.op, a); break;
         }
         if (h.size < 8) { VLOG("[RED] command record of size %u at %p (op %u): submission cut", h.size, (const void *)p, h.op); return; }
         p += h.size;
     }
     VLOG("[RED] a command list did not end within 16M records: submission cut");
 }
-void mtl_sub_begin(void) { lock(); g_sub++; S.has_rt = 0; rec_begin(); }   // the render targets are the snapshots of this submission's records
+static void draw_state_reset(void);
+void mtl_sub_begin(void) { lock(); g_sub++; S.has_rt = 0; draw_state_reset(); rec_begin(); }   // the render targets are the snapshots of this submission's records
 void mtl_sub_index(const uint64_t *h, int n) { (void)h; (void)n; }
 void mtl_exec_rest(const uint64_t *handles, int n) { (void)handles; (void)n; }
 void mtl_exec(const uint8_t *p) { exec_list(p, 0); }
@@ -712,11 +754,6 @@ void mtl_read_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNc
     flush();
     unlock();
 }
-void mtl_set_tex_pool_n(int n) { (void)n; }
-void mtl_reg_tex(int id, const tex_t *t, const view_t *v) { (void)id; (void)t; (void)v; }
-void mtl_reg_image(int id, const tex_t *t, const view_t *v) { (void)id; (void)t; (void)v; }
-void mtl_reg_samp(int id, const samp_par *p) { (void)id; (void)p; }
-void mtl_prog_release(prog_t *p) { (void)p; }
 void mtl_xv_window_tex(uint64_t serial) { (void)serial; }
 static atomic_int g_depth_zero, g_origin_ll = 1;   // NVN starts with the GL conventions (lower-left origin)
 void mtl_set_depth_zero(int on) { atomic_store(&g_depth_zero, on); }
@@ -809,6 +846,7 @@ int nvn_vk_test_frame(uint8_t *rgba, uint32_t w, uint32_t h) {
     lock(); int ok = g_thave && w == g_tw && h == g_th; if (ok) memcpy(rgba, g_tbuf_m.map, (size_t)w * h * 4); unlock(); return ok;
 }
 static void present_headless(vtex *v, VkOffset3D src[2], uint32_t cw, uint32_t ch) {
+    pass_end();
     if (!g_tframe || g_tw != cw || g_th != ch) {
         if (g_tframe) { vkDestroyImage(g_dev, g_tframe, NULL); mem_free(&g_tframe_m); vkDestroyBuffer(g_dev, g_tbuf, NULL); mem_free(&g_tbuf_m); }
         g_tw = cw; g_th = ch;
@@ -941,3 +979,5 @@ ZR(mtl_upload_gpu_ns_take) ZR(mtl_upload_ns_take)
 unsigned mtl_cpu_tex_count(void) { return 0; }
 void mtl_alloc_stats(uint64_t *a, uint64_t *b, int *n) { *a = *b = 0; *n = 0; }
 void mtl_vbuf_stats(uint64_t *resolve, uint64_t *reuse, uint64_t *set, uint64_t *skip, uint64_t *copies, uint64_t *copy_bytes) { *resolve = *reuse = *set = *skip = *copies = *copy_bytes = 0; }
+
+#include "nvn_vk_draw.inc"   // draws and dispatches (stage 2)

@@ -1,0 +1,6 @@
+#version 450
+// storage buffer 0 of the compute stage, through the c0 table (cb offset 0x310 / 4 = 196)
+layout(local_size_x = 4) in;
+layout(set = 0, binding = 0) uniform Support { vec4 a; } support;
+layout(set = 0, binding = 1, std430) buffer S0 { uint v[]; } s0;
+void main() { s0.v[gl_GlobalInvocationID.x] = gl_GlobalInvocationID.x * 3u + 1u; }

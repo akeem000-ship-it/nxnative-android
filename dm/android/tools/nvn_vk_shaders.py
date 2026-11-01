@@ -12,7 +12,7 @@
 #                    in <location> <f|i|u> <components>                 (vertex inputs, by NVN attribute number)
 #                    out <location> <f|i|u>                             (pixel outputs, by render target)
 # Usage: nvn_vk_shaders.py <translation dir> <output dir> [key ...]   (no keys = every <key>.spv there)
-import json, os, struct, sys
+import json, os, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import spv_mobile as sm
 
@@ -33,7 +33,6 @@ def reflect(spv):
         elif op == sm.OP_VARIABLE: vars_.append(ins)
         elif op == sm.OP_EXECUTION_MODE and ins[2] == 17: local = ins[3:6]    # LocalSize
         elif op == 43: ty[ins[2]] = ('const', ins[3])                          # OpConstant (array lengths)
-    blocks = {ins[1] for ins in insns if (ins[0] & 0xffff) == sm.OP_DECORATE and ins[2] == 2}        # Block
     bufblocks = {ins[1] for ins in insns if (ins[0] & 0xffff) == sm.OP_DECORATE and ins[2] == 3}     # BufferBlock (older storage buffers)
     def strip_array(t):
         n = 1

@@ -4,7 +4,7 @@
 # (most Adreno and Mali GPUs have no Float64 or pixel interlock). Each optional capability, with the extension and execution modes that come with it, is dropped when the module
 # has no instruction, type or builtin that needs it; a used one stays (the device must have it; nvn_vk.c enables what the device offers).
 # Usage: spv_mobile.py <in.spv> <out.spv> (prints the capabilities dropped); also imported (strip(bytes) → (bytes, dropped))
-import struct, sys
+import struct
 
 OP_CAPABILITY, OP_EXTENSION, OP_EXECUTION_MODE, OP_DECORATE, OP_MEMBER_DECORATE = 17, 10, 16, 71, 72
 OP_TYPE_INT, OP_TYPE_FLOAT = 21, 22

@@ -264,6 +264,7 @@ DM_UE_SHADERS	path	Folder of the Unreal shader code archives decoded by `uepak.p
 DM_VK_CAPTURE	path	`=<dir>` (Mac) writes every SPIR-V module the game creates to `<dir>/<key>.spv`; the NSP script's Vulkan shader capture stage sets it
 DM_VK_LOG	diagnostic	`=1` logs Vulkan object creation in the Vulkan-on-Metal layer
 DM_VK_NO_BC	diagnostic	`1` makes the Android Vulkan backend decode BC textures on the CPU (bcdec) even when the GPU samples BC, as on phones without BC; `dm/android/tests/t_vk.c nobc` sets it
+DM_VK_SHADERS	path	Folder of the Android Vulkan backend's shaders (`<key>.spv`, `.gl.spv`, `.res`, `.c1` from `dm/android/tools/nvn_vk_shaders.py`); the Android app sets it to its unpacked `dm/vk`
 DM_VK_VALIDATE	diagnostic	`1` turns on the Khronos validation layer in the Android Vulkan backend (`dm/android/gfx/nvn_vk.c`); its warnings and errors are logged as `[vk]` lines, and `dm/android/tests/run_vk.sh` fails on any error
 DM_VSYNC_HZ	switch	`=<Hz>`: rate at which a host thread fires the vi vsync event when the display link does not drive it (default 60)
 DM_WATCH	diagnostic	`=<s>` dumps all threads after that many seconds (SIGALRM) and turns on the stall watchdog; off unless set

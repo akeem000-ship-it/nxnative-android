@@ -149,6 +149,7 @@ static void boot(void) {
     snprintf(p, sizeof p, "%s/save", g_int); mkdirs(p); setenv("DM_SAVE", p, 0);
     snprintf(p, sizeof p, "%s/temp", g_int); mkdirs(p); setenv("DM_TEMP", p, 0);
     snprintf(p, sizeof p, "%s/shader_map.tsv", dm); setenv("DM_NVN_SHMAP", p, 0);
+    snprintf(p, sizeof p, "%s/vk", dm); setenv("DM_VK_SHADERS", p, 0);   // the Vulkan shaders (dm/android/tools/nvn_vk_shaders.py), packed by build_apk.py --shaders
     snprintf(p, sizeof p, "%s/font", dm); setenv("DM_FONT_DIR", p, 0);
     snprintf(p, sizeof p, "%s/font/standard.ttf", dm); struct stat fs;
     if (stat(p, &fs)) {   // no standard font packed (upstream's is macOS's Arial Unicode): the first of Android's own TTFs that exists

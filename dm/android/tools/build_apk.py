@@ -54,7 +54,7 @@ def build_host(game, out, ndk, env, logs):
     run([strip, '--strip-debug', '-o', stripped, so])   # symbols stay (crash backtraces name host functions), debug info goes
     return stripped
 
-def stage_assets(game_dir, patched, modules, out, env_file, std_font, logs):
+def stage_assets(game_dir, patched, modules, out, env_file, std_font, logs, shaders=None):
     """assets/dm: what the iOS app embeds (dm/ios/tools/build_ipa.sh) — the rewritten modules and their tables, the NRO modules, the profile's shader tables, the fonts — and files.txt
     listing them under a stamp of their contents (the app copies them again when the stamp changes)"""
     a = out / 'assets/dm'; shutil.rmtree(out / 'assets', ignore_errors=True); a.mkdir(parents=True)
@@ -86,6 +86,10 @@ def stage_assets(game_dir, patched, modules, out, env_file, std_font, logs):
     try: run([sys.executable, DM / 'tools/make_ext_font.py', a / 'font/nintendo_ext.ttf'] + ([letters] if letters else []), logs / 'android_font.log')
     except BuildError as e: say(f'[RED] no Nintendo extension font (button icons in text will be missing): {str(e).splitlines()[0]} (pip install fonttools)')
     if env_file: shutil.copy2(env_file, a / 'env.txt')
+    if shaders:   # the Vulkan shaders (nvn_vk_shaders.py output): assets/dm/vk
+        (a / 'vk').mkdir()
+        for p in sorted(Path(shaders).iterdir()):
+            if p.suffix in ('.spv', '.res', '.c1'): shutil.copy2(p, a / 'vk' / p.name)
     files = sorted(str(p.relative_to(a)) for p in a.rglob('*') if p.is_file())
     h = hashlib.sha256()
     for f in files: h.update(f.encode() + b'\0'); h.update((a / f).read_bytes())
@@ -170,7 +174,7 @@ def push(apk, package, romfs, aoc, sdk_bt):
         say('copying the add-on content'); run([adb, 'shell', f'rm -rf {dst}/aoc']); run([adb, 'push', f'{aoc}/.', f'{dst}/aoc/'])
     say(f'done: the game is installed; its log is {dst}/log.txt (adb pull {dst}/log.txt, or adb logcat -s nxnative)')
 
-def build(game, patched, romfs, out_apk, name=None, version='1.0', package=None, icon=None, aoc=None, env_file=None, std_font=None, work=None, do_push=False, env=None):
+def build(game, patched, romfs, out_apk, name=None, version='1.0', package=None, icon=None, aoc=None, env_file=None, std_font=None, work=None, do_push=False, env=None, shaders=None):
     """the APK; returns its path. env: the environment the host build runs in (a provisional / derived profile's DM_GAMES_DIR / DM_GAMES_FIRST)"""
     env = dict(env or os.environ)
     sys.path.insert(0, str(DM / 'games')); import game as gamemod
@@ -182,7 +186,8 @@ def build(game, patched, romfs, out_apk, name=None, version='1.0', package=None,
     say(f'[android] host for {name} ({game}) with the NDK {ndk.name}')
     so = build_host(game, work, ndk, env, logs)
     say('[android] game files into the APK')
-    assets, nbytes = stage_assets(Path(g.dir), Path(patched), g.words('modules'), work, env_file, std_font, logs)
+    if not shaders: say('[RED] no Vulkan shaders (--shaders): the game\'s draws are skipped, only clears and copies show')
+    assets, nbytes = stage_assets(Path(g.dir), Path(patched), g.words('modules'), work, env_file, std_font, logs, shaders)
     code = int(time.time() // 60) & 0x7fffffff   # a later build is always an upgrade
     say(f'[android] packing {out_apk} ({nbytes / 2**20:.0f} MB of game files)')
     pack(Path(out_apk), package, name, version or '1.0', code, icon, assets, so, bt, jar, work, logs)
@@ -204,10 +209,11 @@ def main():
     ap.add_argument('--icon', help='app icon (PNG or JPEG)')
     ap.add_argument('--env-file', help='environment switches packed as env.txt')
     ap.add_argument('--standard-font', help='a TTF packed as the standard shared font (default: an Android system font at run time)')
+    ap.add_argument('--shaders', help='the Vulkan shaders: the output folder of dm/android/tools/nvn_vk_shaders.py')
     ap.add_argument('--work', help='work folder (default: a temporary one)')
     ap.add_argument('--push', action='store_true', help='install on the connected device and copy the RomFS and add-on content to it (adb)')
     a = ap.parse_args()
-    try: build(a.game, a.patched, a.romfs, a.out, a.name, a.version, a.package, a.icon, a.aoc, a.env_file, a.standard_font, a.work, a.push)
+    try: build(a.game, a.patched, a.romfs, a.out, a.name, a.version, a.package, a.icon, a.aoc, a.env_file, a.standard_font, a.work, a.push, shaders=a.shaders)
     except BuildError as e: print(f'error: {e}', file=sys.stderr); sys.exit(1)
 
 if __name__ == '__main__':
