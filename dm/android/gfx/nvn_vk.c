@@ -45,7 +45,7 @@ static pthread_mutex_t g_mu;           // every entry point; held from mtl_sub_b
 static pthread_once_t g_once = PTHREAD_ONCE_INIT;
 static VkInstance g_inst; static VkPhysicalDevice g_pd; static VkDevice g_dev; static VkQueue g_q; static uint32_t g_qf;
 static VkPhysicalDeviceMemoryProperties g_memp; static VkPhysicalDeviceProperties g_props;
-static int g_bc, g_astc, g_validate;
+static int g_bc, g_astc, g_validate, g_aniso, g_mirror_clamp;
 static VkDebugUtilsMessengerEXT g_msgr;
 static uint64_t g_fence;               // submissions committed (all complete)
 
@@ -199,7 +199,7 @@ static void dev_init(void) {
     want.textureCompressionBC = have.textureCompressionBC; want.textureCompressionASTC_LDR = have.textureCompressionASTC_LDR;
     want.samplerAnisotropy = have.samplerAnisotropy; want.independentBlend = have.independentBlend; want.imageCubeArray = have.imageCubeArray;
     want.fragmentStoresAndAtomics = have.fragmentStoresAndAtomics; want.shaderStorageImageWriteWithoutFormat = have.shaderStorageImageWriteWithoutFormat;
-    g_bc = have.textureCompressionBC && !getenv("DM_VK_NO_BC"); g_astc = have.textureCompressionASTC_LDR;
+    g_bc = have.textureCompressionBC && !getenv("DM_VK_NO_BC"); g_astc = have.textureCompressionASTC_LDR; g_aniso = have.samplerAnisotropy;
     float prio = 1;
     VkDeviceQueueCreateInfo qi = {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, NULL, 0, g_qf, 1, &prio};
     VkDeviceCreateInfo dci = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, NULL, 0, 1, &qi, 0, NULL, ndx, dext, &want};
@@ -277,7 +277,15 @@ static int fmt_ok(VkFormat f, VkImageType type, VkImageUsageFlags usage, VkImage
     if (vkGetPhysicalDeviceImageFormatProperties(g_pd, f, type, VK_IMAGE_TILING_OPTIMAL, usage, cf, &p) != VK_SUCCESS) return 0;
     return (p.sampleCounts & s) != 0;
 }
-static void tex_free(vtex *v) { if (v->img) vkDestroyImage(g_dev, v->img, NULL); mem_free(&v->m); free(v); }
+static nvn_hmap g_views;
+static void tex_free(vtex *v) {
+    for (uint32_t i = 0; i < g_views.cap;) {   // its sampled views (keys begin with the serial)
+        uint64_t sr; memcpy(&sr, g_views.keys + (size_t)i * g_views.klen, 8);
+        if (g_views.vals[i] && sr == v->serial) { VkImageView iv = (VkImageView)nvn_hm_del(&g_views, g_views.keys + (size_t)i * g_views.klen); vkDestroyImageView(g_dev, iv, NULL); }
+        else i++;
+    }
+    if (v->img) vkDestroyImage(g_dev, v->img, NULL); mem_free(&v->m); free(v);
+}
 static vtex *tex_make(const tex_t *t) {
     const nvn_texdesc *d = &t->d;
     if (d->target == NVN_TEXTURE_TARGET_BUFFER) return NULL;
@@ -456,6 +464,74 @@ static void clear_rect(const vtex *v, unsigned level, unsigned layer, unsigned n
     vkCmdClearAttachments(g_cb, 1, &ca, 1, &cr);
     vkCmdEndRenderPass(g_cb);
     barrier();
+}
+
+// ---------- Samplers (one per distinct parameter set) and sampled views (one per texture, view and swizzle) ----------
+static nvn_hmap g_samp = {.klen = sizeof(samp_par)};
+
+static VkSamplerAddressMode wrap_mode(int w) {
+    switch (w) {
+        case 1: return VK_SAMPLER_ADDRESS_MODE_REPEAT;
+        case 6: return VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT;
+        case 5: return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+        case 2: case 3: case 4: return g_mirror_clamp ? VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE : VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT;   // MIRROR_CLAMP(_TO_BORDER): the edge variant
+        default: return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;   // CLAMP (GL's, half border) and CLAMP_TO_EDGE
+    }
+}
+static VkBorderColor border_color(const float b[4]) {   // Vulkan 1.1 has three fixed border colours: the nearest
+    if (b[3] < 0.5f) return VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
+    return b[0] + b[1] + b[2] > 1.5f ? VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE : VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK;
+}
+static VkSampler sampler_get(const samp_par *p) {
+    samp_par k; memset(&k, 0, sizeof k); k = *p;
+    VkSampler sm = (VkSampler)nvn_hm_get(&g_samp, &k); if (sm) return sm;
+    int mip = p->minf >= 2, lmin = p->minf == 1 || p->minf == 3 || p->minf == 5, lmip = p->minf == 4 || p->minf == 5;
+    float lmn = p->lod_min, lmx = mip ? p->lod_max : lmn + 0.25f;   // no mipmapping: the base level only (Vulkan's recipe: maxLod = minLod + 0.25 with NEAREST)
+    VkSamplerCreateInfo ci = {VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO, NULL, 0, p->magf ? VK_FILTER_LINEAR : VK_FILTER_NEAREST, lmin ? VK_FILTER_LINEAR : VK_FILTER_NEAREST,
+                              lmip ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST, wrap_mode(p->ws), wrap_mode(p->wt), wrap_mode(p->wr), p->lod_bias,
+                              g_aniso && p->aniso > 1, p->aniso > 16 ? 16 : p->aniso < 1 ? 1 : p->aniso, p->cmp_mode == 1, p->cmp_func >= 1 && p->cmp_func <= 8 ? (VkCompareOp)(p->cmp_func - 1) : VK_COMPARE_OP_ALWAYS,
+                              lmn, lmx < lmn ? lmn : lmx, border_color(p->border), VK_FALSE};
+    VKC(vkCreateSampler(g_dev, &ci, NULL, &sm)); nvn_hm_put(&g_samp, &k, (void *)sm); return sm;
+}
+// A view to sample: the texture's levels / layers / format as the NVN view narrows them, the format table's swizzle composed with the view's or the texture's own
+typedef struct { uint64_t serial; view_t v; uint16_t swz; uint8_t has, stencil; } vkey;
+static nvn_hmap g_views = {.klen = sizeof(vkey)};   // (declared before tex_free)
+static VkComponentSwizzle nvn_swz(int c) { static const VkComponentSwizzle m[6] = {VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ONE, VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_G, VK_COMPONENT_SWIZZLE_B, VK_COMPONENT_SWIZZLE_A}; return c >= 0 && c < 6 ? m[c] : VK_COMPONENT_SWIZZLE_IDENTITY; }
+static VkComponentSwizzle compose(VkComponentSwizzle outer, const VkComponentSwizzle inner[4], int self) {   // outer picks a component of what inner gives
+    if (outer == VK_COMPONENT_SWIZZLE_IDENTITY) outer = (VkComponentSwizzle)(VK_COMPONENT_SWIZZLE_R + self);
+    if (outer < VK_COMPONENT_SWIZZLE_R) return outer;
+    int k = outer - VK_COMPONENT_SWIZZLE_R; VkComponentSwizzle r = inner[k];
+    return r == VK_COMPONENT_SWIZZLE_IDENTITY ? (VkComponentSwizzle)(VK_COMPONENT_SWIZZLE_R + k) : r;
+}
+static VkImageViewType view_type(const vtex *v, int target, unsigned nlayers) {
+    switch (target) {
+        case NVN_TEXTURE_TARGET_3D: return VK_IMAGE_VIEW_TYPE_3D;
+        case NVN_TEXTURE_TARGET_CUBEMAP: return VK_IMAGE_VIEW_TYPE_CUBE;
+        case NVN_TEXTURE_TARGET_CUBEMAP_ARRAY: return VK_IMAGE_VIEW_TYPE_CUBE_ARRAY;
+        case NVN_TEXTURE_TARGET_1D_ARRAY: case NVN_TEXTURE_TARGET_2D_ARRAY: case NVN_TEXTURE_TARGET_2D_MULTISAMPLE_ARRAY: return VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+        default: return v->type == VK_IMAGE_TYPE_3D ? VK_IMAGE_VIEW_TYPE_3D : nlayers > 1 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
+    }
+}
+static VkImageView sampled_view(vtex *v, const view_t *vw, int has) {
+    vkey k; memset(&k, 0, sizeof k); k.serial = v->serial; k.has = (uint8_t)has; if (has) k.v = *vw; k.swz = v->t.set_swz ? v->t.swz : 0; k.stencil = v->t.stencil;
+    VkImageView iv = (VkImageView)nvn_hm_get(&g_views, &k); if (iv) return iv;
+    unsigned level = has && vw->set_levels ? vw->base_level : 0, nlev = has && vw->set_levels && vw->nlevels ? vw->nlevels : v->levels - level;
+    unsigned layer = has && vw->set_layers ? vw->min_layer : 0, nl = has && vw->set_layers && vw->nlayers ? vw->nlayers : (v->type == VK_IMAGE_TYPE_3D ? 1 : v->layers - layer);
+    int target = has && vw->set_target ? vw->target : v->t.d.target;
+    VkImageViewType vt = view_type(v, target, nl);
+    if ((vt == VK_IMAGE_VIEW_TYPE_CUBE && nl < 6) || (vt == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY && nl % 6)) vt = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+    if (vt == VK_IMAGE_VIEW_TYPE_CUBE) nl = 6;
+    VkImageAspectFlags asp = v->aspect & VK_IMAGE_ASPECT_COLOR_BIT ? VK_IMAGE_ASPECT_COLOR_BIT : (v->t.stencil || (has && vw->set_dsmode && vw->dsmode == 1)) && (v->aspect & VK_IMAGE_ASPECT_STENCIL_BIT) ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_DEPTH_BIT;
+    VkComponentMapping cm = {v->f.swz[0], v->f.swz[1], v->f.swz[2], v->f.swz[3]};
+    if (v->decoded || v->f.expand) cm = (VkComponentMapping){VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, v->f.swz[3]};
+    uint16_t sw = has && vw->set_swizzle ? (uint16_t)(vw->swz[0] | vw->swz[1] << 3 | vw->swz[2] << 6 | vw->swz[3] << 9) : v->t.set_swz ? v->t.swz : 0;
+    if (sw || (has && vw->set_swizzle)) {   // the game's swizzle (r | g << 3 | b << 6 | a << 9, NVN's channel enum) picks components of what the format gives
+        VkComponentSwizzle inner[4] = {cm.r, cm.g, cm.b, cm.a}, o[4];
+        for (int c = 0; c < 4; c++) o[c] = compose(nvn_swz(sw >> (3 * c) & 7), inner, c);
+        cm = (VkComponentMapping){o[0], o[1], o[2], o[3]};
+    }
+    VkImageViewCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, NULL, 0, v->img, vt, v->fmt, cm, {asp, level, nlev ? nlev : 1, layer, nl ? nl : 1}};
+    VKC(vkCreateImageView(g_dev, &ci, NULL, &iv)); nvn_hm_put(&g_views, &k, (void *)iv); return iv;
 }
 
 // ---------- Replay ----------
