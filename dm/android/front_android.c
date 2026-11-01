@@ -26,6 +26,7 @@
 void guest_clock_freeze_for(int reason, int on);
 int main(int argc, char **argv);   // dm/host/main.c
 
+void nvn_vk_window_lost(void) __attribute__((weak));   // gfx/nvn_vk.c (absent with the null device)
 static struct android_app *g_app;
 static _Atomic(ANativeWindow *) g_window;
 static char g_ext[512], g_int[512];
@@ -257,7 +258,7 @@ static int g_started_once, g_bg;
 static void on_cmd(struct android_app *app, int32_t cmd) {
     switch (cmd) {
         case APP_CMD_INIT_WINDOW: atomic_store(&g_window, app->window); if (!atomic_load(&g_host_started)) boot(); break;
-        case APP_CMD_TERM_WINDOW: atomic_store(&g_window, NULL); break;
+        case APP_CMD_TERM_WINDOW: atomic_store(&g_window, NULL); if (nvn_vk_window_lost) nvn_vk_window_lost(); break;   // the backend lets go of it before it is released
         case APP_CMD_GAINED_FOCUS: if (atomic_load(&g_host_started)) dm_focus_set(1); break;
         case APP_CMD_LOST_FOCUS: if (atomic_load(&g_host_started)) dm_focus_set(2); break;
         case APP_CMD_STOP:

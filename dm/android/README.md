@@ -2,7 +2,7 @@
 
 The Android port runs the same host as the Mac and iOS builds: the game's own arm64 code, rewritten where the platform requires it, on a host that answers Horizon's SVCs and the SDK's services. This folder holds what Android needs in place of Apple's pieces. Upstream sources build unchanged wherever they can, so the port follows the main line.
 
-**Status:** the host builds for Android 12 and later (arm64), and an APK packs from an NSP folder. **There is no graphics backend yet.** `gfx/nvn_null.c` is a null device: the game runs its frame loop with GPU work completing at once, and nothing is drawn. The Vulkan backend is the next step (see [Roadmap](#roadmap)). No game has been run on a device yet: everything below is checked by building and by the tests in `tests/` (under qemu-aarch64), not on a phone.
+**Status:** the host builds for Android 12 and later (arm64), and an APK packs from an NSP folder. The Vulkan backend (`gfx/nvn_vk.c`) is at stage 1: textures, copies, clears and presenting to the screen work; **draws and compute dispatches are not executed yet**, so a game shows only what it clears or copies (see [Roadmap](#roadmap)). `-DGFX=null` builds the null device instead (`gfx/nvn_null.c`: nothing drawn). No game has been run on a device yet: everything below is checked by building and by the tests in `tests/` (under qemu-aarch64), not on a phone.
 
 ## Building an APK
 
@@ -40,7 +40,8 @@ Controllers map by position, as on the Mac and iPhone: the right face button is 
 | Darwin signal contexts | Linux sigcontext (same integer layout), FPSIMD and ESR records | `dm/host/dm.h` `DM_UC_*` |
 | CoreAudio AudioUnit | AAudio | `au_aaudio.c` |
 | VideoToolbox (H.264), AudioToolbox (AAC) | MediaCodec | `movie_avc_mediacodec.c`, `movie_aac_mediacodec.c` |
-| Metal (NVN, Vulkan and GL layers) | none yet: the null device | `gfx/nvn_null.c` |
+| Metal (the NVN layer's execution) | Vulkan 1.1, stage 1: textures, copies, clears, present (no draws yet) | `gfx/nvn_vk.c`, `gfx/nvn_fmt_vk.c` |
+| Metal (the Vulkan and GL layers of Hades and other Vulkan / GL games) | none yet | |
 | UIKit / AppKit front end | NativeActivity | `front_android.c` |
 
 ## Tests
@@ -50,16 +51,18 @@ Controllers map by position, as on the Mac and iPhone: the right face button is 
 - `t_compat`: the compat layer on bionic. It covers thread slots read through the rewritten code's own instruction sequence on nine threads, thread suspension and register state, fault-safe memory reads and regions, signal context records, SHA-256, the dictionary, semaphores, `clonefile` / `renamex_np` / xattrs, `F_GETPATH` and registry sections.
 - `t_rewrite`: a module rewritten with `DM_TARGET=android`, mapped as the loader maps it and run on five threads through `dm/host/entry.S`. Each thread's x18 and thread register accesses reach its own slots, and its `svc` reaches the gate.
 
+`tests/run_vk.sh` builds the Vulkan backend for the desktop and runs `t_vk.c` on any Vulkan 1.1 device (Mesa's lavapipe without a GPU), with the validation layer when installed, twice: BC textures sampled by the device and decoded on the CPU. It records command lists as `hle_nvn.c` does and checks scissored, layered and depth clears, buffer ↔ texture round trips with row strides, deswizzled packaged textures, copies and mirrored blits, BC1 decoding, events, counters and fences in order, and the presented frame (flipped, cropped).
+
 `dm/tools/tests/test_rewrite_target.py` checks the rewriter's output for both targets.
 
 ## Known gaps
 
-- **Graphics:** nothing is drawn (above). A compute shader's buffer results are not produced either, which a game may wait on.
+- **Graphics:** draws and compute dispatches are not executed (stage 1), so most of a game's picture is missing, and a compute shader's buffer results, which a game may wait on, are not produced. Submissions complete before the call returns (the CPU waits for the GPU each time), and every image stays in layout `GENERAL`: simple, not yet fast.
 - **Text input** (the software keyboard) reports no window, and the progress screen only logs.
 - **Rumble, motion controls, the frame-rate display and the settings launcher** are not there yet.
 - **Real-time scheduling:** the present thread gets no real-time policy (Android gives apps none); ADPF performance hints are the Android tool for it.
 
 ## Roadmap
 
-1. **Vulkan backend.** It takes the null device's place behind the same interface as `nvn_mtl.m` (`dm/gfx/nvn/nvn_mtl.h`, `nvn_obj.h`). The shader chain already ends in SPIR-V (Ryujinx's translator), which Vulkan takes without SPIRV-Cross's Metal step. Most phones read no BC textures, so those are transcoded to ASTC or RGBA at upload. Presents go to the `ANativeWindow` (`front_metal_layer`) through a swapchain, paced by `AChoreographer`.
+1. **Vulkan backend, stage 2: draws.** The shader chain already ends in SPIR-V (Ryujinx's translator), which Vulkan takes without SPIRV-Cross's Metal step: pipelines from the profile's shader tables, descriptor sets for NVN's texture and sampler pools and uniform / storage buffers over the game's memory, render passes from the bound targets. Then asynchronous submission, per-image layouts and presents paced by `AChoreographer`.
 2. **A Java launcher** for settings, text input, rumble and picking the RomFS without `adb`.

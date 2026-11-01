@@ -227,7 +227,7 @@ A connected game controller hides the touch controls and keeps every button.
 
 ## Android (in progress)
 
-An Android port is under way in [dm/android](dm/android/README.md): the host builds for Android 12 and later (arm64), and `--platform android` packs an APK. There is no graphics backend yet, so games do not show anything on Android.
+An Android port is under way in [dm/android](dm/android/README.md): the host builds for Android 12 and later (arm64), and `--platform android` packs an APK. Its Vulkan graphics backend presents to the screen, but does not draw yet, so games show almost nothing on Android so far.
 
 ## For developers
 
